@@ -1883,13 +1883,21 @@ pub const Config = struct {
     }
 
     pub fn resolveAgentWorkspacePath(self: *const Config, allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
-        if (std_compat.fs.path.isAbsolute(workspace_path)) {
-            return try allocator.dupe(u8, workspace_path);
-        }
-        const normalized_workspace_path = try normalizeHostPathSeparators(allocator, workspace_path);
-        defer allocator.free(normalized_workspace_path);
-        const home_dir = std_compat.fs.path.dirname(self.config_path) orelse self.workspace_dir;
-        return try std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path });
+        const joined = blk: {
+            if (std_compat.fs.path.isAbsolute(workspace_path)) {
+                break :blk try allocator.dupe(u8, workspace_path);
+            }
+            const normalized_workspace_path = try normalizeHostPathSeparators(allocator, workspace_path);
+            defer allocator.free(normalized_workspace_path);
+            const home_dir = std_compat.fs.path.dirname(self.config_path) orelse self.workspace_dir;
+            break :blk try std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path });
+        };
+        // Resolve symlinks so sandbox --bind receives the real underlying path.
+        // Falls back to the unresolved path when the workspace does not yet exist
+        // (e.g. first run before scaffoldAgentWorkspace creates the directory).
+        const real = std_compat.fs.cwd().realpathAlloc(allocator, joined) catch return joined;
+        allocator.free(joined);
+        return real;
     }
 
     pub fn resolveAgentWorkspace(self: *const Config, allocator: std.mem.Allocator, agent_name: []const u8) ![]const u8 {

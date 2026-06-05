@@ -217,7 +217,21 @@ pub const McpServer = struct {
         const stdin = self.child.?.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
 
-        return try self.readLine(allocator);
+        // Skip server-initiated notifications (no "id" field) before returning
+        // the actual response. Some MCP servers (e.g. email-mcp) emit
+        // notifications/message lines on startup before the initialize response.
+        while (true) {
+            const line = try self.readLine(allocator);
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+                return line; // not JSON — return as-is, let caller handle
+            };
+            const is_notification = parsed.value == .object and
+                parsed.value.object.get("method") != null and
+                parsed.value.object.get("id") == null;
+            parsed.deinit();
+            if (!is_notification) return line;
+            allocator.free(line);
+        }
     }
 
     fn sendNotification(self: *McpServer, method: []const u8, params: ?[]const u8) !void {

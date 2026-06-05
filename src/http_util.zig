@@ -581,6 +581,17 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
+    // Allow operator-specified private hosts (e.g. Tailscale VPN endpoints).
+    // Set NULLCLAW_TRUST_PRIVATE_HOSTS=host1,host2 to bypass SSRF checks for
+    // specific hostnames. Use only for trusted internal infrastructure.
+    if (std.c.getenv("NULLCLAW_TRUST_PRIVATE_HOSTS")) |trust_cstr| {
+        var it = std.mem.splitScalar(u8, std.mem.span(trust_cstr), ',');
+        while (it.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (std.mem.eql(u8, trimmed, host)) return null;
+        }
+    }
+
     const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err|
         return mapResolveConnectHostError(host, err);
     defer allocator.free(connect_host);

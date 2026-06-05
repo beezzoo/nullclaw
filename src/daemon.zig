@@ -37,6 +37,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const observability = @import("observability.zig");
+const security_policy = @import("security/policy.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -541,6 +542,17 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
+    scheduler.setShellPolicy(.{
+        .autonomy = config.autonomy.level,
+        .workspace_dir = config.workspace_dir,
+        .workspace_only = config.autonomy.workspace_only,
+        .allowed_commands = security_policy.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
+        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .block_medium_risk_commands = config.autonomy.block_medium_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
+    });
     defer scheduler.deinit();
     defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;

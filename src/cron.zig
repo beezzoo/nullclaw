@@ -2414,6 +2414,17 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     if (cfg_opt) |cfg| {
         scheduler.setShellCwd(cfg.workspace_dir);
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+        scheduler.setShellPolicy(.{
+            .autonomy = cfg.autonomy.level,
+            .workspace_dir = cfg.workspace_dir,
+            .workspace_only = cfg.autonomy.workspace_only,
+            .allowed_commands = security_policy.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
+            .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
+            .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
+        });
     }
     try loadJobs(&scheduler);
     const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
