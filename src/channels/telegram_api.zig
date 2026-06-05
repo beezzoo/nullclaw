@@ -310,10 +310,11 @@ pub const Client = struct {
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
-        _ = timeout;
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
+        // Use curl subprocess: std.http.Client is not thread-safe for TLS init
+        // from the typing-indicator thread (crashes in crypto.tls.Client.init).
+        return root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout);
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
