@@ -1956,9 +1956,6 @@ pub const TelegramChannel = struct {
         payload: root.Channel.OutboundPayload,
         reply_to: ?i64,
     ) !void {
-        // Send typing indicator (best-effort)
-        self.sendTypingIndicator(target);
-
         if (shouldRenderChoiceButtons(payload)) {
             var directive = buildChoicesDirectiveFromPayload(self.allocator, payload.choices) catch |err| {
                 log.warn("telegram buildChoicesDirectiveFromPayload failed, falling back to plain send: {}", .{err});
