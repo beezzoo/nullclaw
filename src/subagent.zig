@@ -604,7 +604,17 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     }
 
     const configured_provider = findConfiguredProvider(ctx.manager.configured_providers, default_provider);
-    const api_key = resolveSubagentProviderApiKey(configured_provider, explicit_api_key, ctx.manager.api_key);
+    var api_key = resolveSubagentProviderApiKey(configured_provider, explicit_api_key, ctx.manager.api_key);
+
+    // Fall back to provider env vars (e.g. ZAI_API_KEY) when neither the agent
+    // profile nor the configured provider carries an explicit key — mirrors how
+    // the main provider runtime resolves credentials.
+    var env_api_key: ?[]u8 = null;
+    defer if (env_api_key) |key| ctx.manager.allocator.free(key);
+    if (api_key == null) {
+        env_api_key = providers.resolveApiKey(ctx.manager.allocator, default_provider, null) catch null;
+        if (env_api_key) |key| api_key = key;
+    }
 
     if (ctx.manager.task_runner) |runner| {
         const request = TaskRunRequest{
