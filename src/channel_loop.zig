@@ -1033,6 +1033,7 @@ fn processTelegramMessage(
         };
     }
     tg_ptr.setTaskReaction(sender, message_id, .done);
+    tg_ptr.deleteProcessedMessage(sender, message_id);
 }
 
 /// Task context for processing a message in a worker thread.

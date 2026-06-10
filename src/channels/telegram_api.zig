@@ -198,6 +198,24 @@ pub const Client = struct {
         if (responseHasTelegramError(resp)) return error.TelegramApiError;
     }
 
+    pub fn deleteMessage(self: Client, chat_id: []const u8, message_id: i64) !void {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        try body.appendSlice(self.allocator, "{\"chat_id\":");
+        try body.appendSlice(self.allocator, chat_id);
+
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(self.allocator, ",\"message_id\":");
+        try body.appendSlice(self.allocator, msg_id_str);
+        try body.appendSlice(self.allocator, "}");
+
+        const resp = try self.post(self.allocator, "deleteMessage", body.items, "10");
+        defer self.allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+    }
+
     pub fn createForumTopic(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, name: []const u8) !ForumTopicMeta {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);

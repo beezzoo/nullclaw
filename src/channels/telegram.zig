@@ -685,6 +685,7 @@ pub const TelegramChannel = struct {
     streaming_enabled: bool = true,
     draft_previews_enabled: bool = true,
     status_reactions_enabled: bool = false,
+    delete_processed_targets: []const []const u8 = &.{},
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
     binding_commands_enabled: bool = true,
     topic_commands_enabled: bool = true,
@@ -752,6 +753,7 @@ pub const TelegramChannel = struct {
         ch.streaming_enabled = cfg.streaming;
         ch.draft_previews_enabled = cfg.draft_previews;
         ch.status_reactions_enabled = cfg.status_reactions;
+        ch.delete_processed_targets = cfg.delete_processed_targets;
         ch.reaction_emojis = cfg.reaction_emojis;
         ch.binding_commands_enabled = cfg.binding_commands_enabled;
         ch.topic_commands_enabled = cfg.topic_commands_enabled;
@@ -1160,6 +1162,26 @@ pub const TelegramChannel = struct {
             .emoji = self.taskReactionEmoji(reaction),
         }) catch |err| {
             log.debug("telegram setMessageReaction failed: {}", .{err});
+        };
+    }
+
+    /// Delete the triggering user message after successful processing.
+    /// Only acts when `target` is listed in `delete_processed_targets`. Best-effort.
+    pub fn deleteProcessedMessage(self: *TelegramChannel, target: []const u8, message_id: ?i64) void {
+        const msg_id = message_id orelse return;
+        if (target.len == 0) return;
+        var enabled = false;
+        for (self.delete_processed_targets) |configured| {
+            if (std.mem.eql(u8, configured, target)) {
+                enabled = true;
+                break;
+            }
+        }
+        if (!enabled) return;
+        if (builtin.is_test) return;
+        const parsed_target = parseTelegramTarget(target);
+        self.api().deleteMessage(parsed_target.chat_id, msg_id) catch |err| {
+            log.warn("telegram deleteMessage failed for processed message: {}", .{err});
         };
     }
 

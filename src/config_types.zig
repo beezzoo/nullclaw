@@ -621,6 +621,10 @@ pub const TelegramConfig = struct {
     draft_previews: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
+    /// Delete the triggering user message after the agent successfully processed it
+    /// and the reply was delivered. List of targets ("<chat_id>" or
+    /// "<chat_id>#topic:<thread_id>"). Requires can_delete_messages admin right.
+    delete_processed_targets: []const []const u8 = &.{},
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
     reaction_emojis: TelegramReactionEmojisConfig = .{},
     /// Enable Telegram-specific binding commands such as /bind.
