@@ -1505,9 +1505,16 @@ pub fn runTelegramLoop(
     loop_state: *TelegramLoopState,
     tg_ptr: *telegram.TelegramChannel,
 ) void {
-    // Set up transcription — key comes from providers.{audio_media.provider}
+    // Set up transcription — key comes from providers.{audio_media.provider},
+    // falling back to provider env vars (e.g. GROQ_API_KEY) like the main
+    // provider runtime does.
     const trans = config.audio_media;
-    if (config.getProviderKey(trans.provider)) |key| {
+    var trans_env_key: ?[]u8 = null;
+    defer if (trans_env_key) |key| allocator.free(key);
+    if (config.getProviderKey(trans.provider) == null) {
+        trans_env_key = providers.resolveApiKey(allocator, trans.provider, null) catch null;
+    }
+    if (config.getProviderKey(trans.provider) orelse trans_env_key) |key| {
         const wt = allocator.create(voice.WhisperTranscriber) catch {
             log.warn("Failed to allocate WhisperTranscriber", .{});
             return;
