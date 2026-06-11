@@ -533,7 +533,6 @@ pub const Agent = struct {
             .full, .read_only, .yolo => .off,
             .supervised => .on_miss,
         };
-
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
         // Ownership transfers to Agent only after all initialization succeeds.

@@ -542,6 +542,9 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
+    if (config.scheduler.shell_timeout_secs > 0) {
+        scheduler.setShellLimits(config.scheduler.shell_timeout_secs * std.time.ns_per_s, scheduler.shell_max_output_bytes);
+    }
     scheduler.setShellPolicy(.{
         .autonomy = config.autonomy.level,
         .workspace_dir = config.workspace_dir,

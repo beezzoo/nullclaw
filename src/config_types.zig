@@ -346,6 +346,8 @@ pub const SchedulerConfig = struct {
     max_concurrent: u32 = 4,
     /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
     agent_timeout_secs: u64 = 0,
+    /// Hard timeout for cron shell job execution in seconds. 0 = default (60s).
+    shell_timeout_secs: u64 = 0,
 };
 
 // ── Tool filter groups ──────────────────────────────────────────

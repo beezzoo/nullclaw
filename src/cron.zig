@@ -2414,6 +2414,9 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     if (cfg_opt) |cfg| {
         scheduler.setShellCwd(cfg.workspace_dir);
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+        if (cfg.scheduler.shell_timeout_secs > 0) {
+            scheduler.setShellLimits(cfg.scheduler.shell_timeout_secs * std.time.ns_per_s, scheduler.shell_max_output_bytes);
+        }
         scheduler.setShellPolicy(.{
             .autonomy = cfg.autonomy.level,
             .workspace_dir = cfg.workspace_dir,
