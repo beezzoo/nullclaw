@@ -1389,6 +1389,14 @@ fn processInboundMessage(
     };
     defer allocator.free(reply);
 
+    // Suppress [NO_REPLY] marker replies for group chats and cron-injected
+    // messages (mirrors shouldSuppressGroupReply in channel_loop.zig, which
+    // this dispatch path bypasses).
+    const suppress_no_reply = (parsed_meta.fields.is_group orelse false) or
+        std.mem.startsWith(u8, routing_plan.outbound_chat_id, "-") or
+        std.mem.eql(u8, msg.sender_id, "system:cron");
+    if (suppress_no_reply and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null) return;
+
     if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
         if (outbound_channel) |channel| {
             var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
