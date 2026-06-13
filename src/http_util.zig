@@ -457,7 +457,14 @@ pub fn httpRequest(
 ) ![]u8 {
     const resp = try httpRequestWithStatus(allocator, method, url, body, headers, content_type, proxy);
     errdefer allocator.free(resp.body);
-    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    if (resp.status_code < 200 or resp.status_code >= 300) {
+        // Surface the server's error body — it carries the actual failure
+        // reason (invalid field, unsupported model, etc). Without this the
+        // caller only sees HttpStatusError and the body is discarded.
+        const preview_len = @min(resp.body.len, @as(usize, 512));
+        log.warn("HTTP {d} from {s}: {s}", .{ resp.status_code, url, resp.body[0..preview_len] });
+        return error.HttpStatusError;
+    }
     return resp.body;
 }
 
