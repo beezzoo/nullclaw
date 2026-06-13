@@ -120,10 +120,12 @@ pub fn nowMs() i64 {
 }
 
 fn isDebounceEligible(msg: bus.InboundMessage) bool {
-    if (msg.media.len > 0) return false;
+    // Media-bearing messages participate in debounce so a forwarded post
+    // (image + caption) merges with a following text instruction ("с тегом …")
+    // into one turn instead of firing two disconnected turns.
     const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    if (trimmed[0] == '/') return false;
+    if (trimmed.len == 0 and msg.media.len == 0) return false;
+    if (trimmed.len > 0 and trimmed[0] == '/') return false;
     return true;
 }
 
@@ -147,9 +149,35 @@ fn mergeIntoPending(allocator: std.mem.Allocator, pending: *bus.InboundMessage, 
     }
     try merged.appendSlice(allocator, incoming.content);
 
+    // Build a combined media array before mutating `pending`, so a failure
+    // leaves `pending` untouched. Pending's element pointers are moved in
+    // (ownership retained); incoming's are duped because the caller frees
+    // `incoming` after this returns.
+    var new_media: ?[][]const u8 = null;
+    var duped_count: usize = 0;
+    errdefer if (new_media) |nm| {
+        var k: usize = 0;
+        while (k < duped_count) : (k += 1) allocator.free(nm[pending.media.len + k]);
+        allocator.free(nm);
+    };
+    if (incoming.media.len > 0) {
+        const nm = try allocator.alloc([]const u8, pending.media.len + incoming.media.len);
+        new_media = nm;
+        for (pending.media, 0..) |m, i| nm[i] = m;
+        for (incoming.media, 0..) |m, j| {
+            nm[pending.media.len + j] = try allocator.dupe(u8, m);
+            duped_count += 1;
+        }
+    }
+
     const merged_content = try merged.toOwnedSlice(allocator);
     allocator.free(pending.content);
     pending.content = merged_content;
+
+    if (new_media) |nm| {
+        if (pending.media.len > 0) allocator.free(pending.media);
+        pending.media = nm;
+    }
 }
 
 test "inbound debouncer merges same sender and session key" {
@@ -170,6 +198,49 @@ test "inbound debouncer merges same sender and session key" {
     try debouncer.flushMatured(5_100, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqualStrings("hello\nworld", out.items[0].content);
+}
+
+test "inbound debouncer merges media message with following text" {
+    const allocator = std.testing.allocator;
+    var debouncer = InboundDebouncer.init(allocator, 3000);
+    defer debouncer.deinit();
+
+    var out: std.ArrayListUnmanaged(bus.InboundMessage) = .empty;
+    defer {
+        for (out.items) |msg| msg.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    // Forwarded post with an image, then a follow-up tag instruction.
+    try debouncer.push(try bus.makeInboundFull(allocator, "telegram", "u1", "c1", "[IMAGE:/tmp/a.jpg] post", "telegram:c1", &.{"/tmp/a.jpg"}, null), 1_000, &out);
+    try debouncer.push(try bus.makeInbound(allocator, "telegram", "u1", "c1", "с тегом locus", "telegram:c1"), 2_000, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+
+    try debouncer.flushMatured(5_100, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("[IMAGE:/tmp/a.jpg] post\nс тегом locus", out.items[0].content);
+    try std.testing.expectEqual(@as(usize, 1), out.items[0].media.len);
+    try std.testing.expectEqualStrings("/tmp/a.jpg", out.items[0].media[0]);
+}
+
+test "inbound debouncer merges two media messages" {
+    const allocator = std.testing.allocator;
+    var debouncer = InboundDebouncer.init(allocator, 3000);
+    defer debouncer.deinit();
+
+    var out: std.ArrayListUnmanaged(bus.InboundMessage) = .empty;
+    defer {
+        for (out.items) |msg| msg.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    try debouncer.push(try bus.makeInboundFull(allocator, "telegram", "u1", "c1", "[IMAGE:/tmp/a.jpg]", "telegram:c1", &.{"/tmp/a.jpg"}, null), 1_000, &out);
+    try debouncer.push(try bus.makeInboundFull(allocator, "telegram", "u1", "c1", "[IMAGE:/tmp/b.jpg]", "telegram:c1", &.{"/tmp/b.jpg"}, null), 2_000, &out);
+    try debouncer.flushMatured(5_100, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(usize, 2), out.items[0].media.len);
+    try std.testing.expectEqualStrings("/tmp/a.jpg", out.items[0].media[0]);
+    try std.testing.expectEqualStrings("/tmp/b.jpg", out.items[0].media[1]);
 }
 
 test "inbound debouncer bypasses slash commands" {
