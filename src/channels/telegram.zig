@@ -2198,16 +2198,38 @@ pub const TelegramChannel = struct {
         return buildTaggedAttachmentContent(allocator, "[IMAGE:", local_path, message);
     }
 
+    fn isVideoDocument(doc: telegram_update_ingress.DocumentInfo) bool {
+        if (doc.mime_type) |mime| {
+            if (std.mem.startsWith(u8, mime, "video/")) return true;
+        }
+        if (doc.file_name) |name| {
+            const exts = [_][]const u8{ ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".wmv" };
+            for (exts) |ext| {
+                if (name.len >= ext.len and std.ascii.eqlIgnoreCase(name[name.len - ext.len ..], ext)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolveDocumentContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
         const doc = telegram_update_ingress.documentInfo(message) orelse return null;
-        if (downloadTelegramFile(allocator, self.bot_token, doc.file_id, doc.file_name, self.proxy)) |local_path| {
-            defer allocator.free(local_path);
-            return buildTaggedAttachmentContent(allocator, "[FILE:", local_path, message);
+
+        // Skip downloading video documents. Large videos take tens of seconds,
+        // which blocks the synchronous poll loop and splits a forwarded post
+        // from its follow-up text (the text gets processed before the video
+        // lands). The caption/metadata still reaches the agent, and glm-5.2
+        // can't read media anyway. Other documents (PDF, etc.) download as before.
+        const is_video = isVideoDocument(doc);
+        if (!is_video) {
+            if (downloadTelegramFile(allocator, self.bot_token, doc.file_id, doc.file_name, self.proxy)) |local_path| {
+                defer allocator.free(local_path);
+                return buildTaggedAttachmentContent(allocator, "[FILE:", local_path, message);
+            }
         }
 
         return buildAttachmentMetadataFallbackContent(
             allocator,
-            "document",
+            if (is_video) "video" else "document",
             doc.file_name,
             doc.mime_type,
             doc.file_size,
