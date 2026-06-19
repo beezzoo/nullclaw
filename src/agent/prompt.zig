@@ -991,8 +991,14 @@ fn appendDateTimeSection(w: anytype, timezone: []const u8) !void {
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
 
-    try w.print("## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} {s}\n\n", .{
-        year, month, day, hour, minute, tz_label,
+    // Day of week — gives the model a grounded anchor for relative-date math
+    // ("next Monday", "в понедельник") instead of guessing the weekday itself.
+    // 1970-01-01 (epoch day 0) was a Thursday → index 4 with 0=Sunday.
+    const weekday_names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    const weekday = weekday_names[@intCast((epoch_day.day + 4) % 7)];
+
+    try w.print("## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} ({s}) {d:0>2}:{d:0>2} {s}\n\n", .{
+        year, month, day, weekday, hour, minute, tz_label,
     });
 }
 
