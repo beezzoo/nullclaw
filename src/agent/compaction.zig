@@ -148,8 +148,10 @@ pub fn autoCompactHistory(
         try allocator.dupe(u8, summary);
     defer allocator.free(summary_with_context);
 
-    // Create the compaction summary message
-    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
+    // Label the summary as a historical snapshot so the model does not treat
+    // anything inside it as current state — the world may have changed since
+    // compaction ran. Agent-specific instructions decide what to re-verify.
+    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary — historical snapshot of earlier conversation. Any state reported here (counts, statuses, external data, tool outputs) reflects what was true at compaction time and may have changed since. Treat as background context, not current state; verify against live sources when it matters.]\n{s}", .{summary_with_context});
 
     // Free old messages being compacted
     for (history.items[start..compact_end]) |*msg| {
@@ -320,7 +322,7 @@ fn summarizeSlice(
     const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars, redactor);
     defer allocator.free(transcript);
 
-    const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+    const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve durable info: user preferences, commitments, decisions, what was discussed. For anything that can change between turns (counts, statuses, external data, tool outputs) — record it as 'at the time, X was reported' rather than a settled fact. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
     const summarizer_user = try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
     defer allocator.free(summarizer_user);
 
