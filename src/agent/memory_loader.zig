@@ -276,7 +276,7 @@ pub fn enrichMessage(
     }
 
     defer allocator.free(context);
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
+    return try std.fmt.allocPrint(allocator, "{s}\n[Current message]\n{s}", .{ context, user_message });
 }
 
 /// Enrich a user message using the retrieval engine if available, else raw recall.
@@ -298,7 +298,7 @@ pub fn enrichMessageWithRuntime(
     }
 
     defer allocator.free(context);
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ context, user_message });
+    return try std.fmt.allocPrint(allocator, "{s}\n[Current message]\n{s}", .{ context, user_message });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
