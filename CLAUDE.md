@@ -6,6 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Read `AGENTS.md` before any code change. It is the authoritative engineering protocol covering architecture, naming conventions, anti-patterns, change playbooks, and validation requirements.
 
+## Spec-Driven Development (OpenSpec)
+
+This clone is a local fork behind `~/.nullclaw-locus` (the running agent instance) — every code change here exists to serve that instance. Development is planned through OpenSpec, but this repo does **not** own its own spec set: it targets the `nullclaw-locus` store.
+
+- Always pass `--store nullclaw-locus` on `openspec` commands run from this repo (`/opsx:propose`, `/opsx:apply`, `openspec list`, etc.) — there is no local `openspec/` directory here by design, so omitting the flag resolves the wrong (or no) root.
+- A change proposed and planned in the `nullclaw-locus` store may require editing this repo's Zig source. When it does: implement here, validate with `zig build test --summary all`, then save the diff as `~/.nullclaw-locus/patches/<name>.patch` (`git diff -- <file> > ...`) and commit both here (`local: apply <name>.patch`) and in `~/.nullclaw-locus` (adds the tracked `.patch` file) — this is the existing convention for the 15+ local patches already in this repo's history (`git log --oneline origin/main..HEAD`).
+- Deploying a change: `~/.local/bin/nullclaw-rebuild.sh` (runs the test suite, builds `ReleaseSmall`, replaces `~/.local/bin/nullclaw`, restarts `nullclaw.service`).
+
 ## Build & Test Commands
 
 ```bash
