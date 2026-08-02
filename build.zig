@@ -572,6 +572,15 @@ pub fn build(b: *std.Build) void {
         });
     exe.root_module.addImport("build_options", build_options_module);
 
+    // zig 0.16.0's self-hosted x86_64 ELF linker cannot handle the SFrame
+    // unwind-info relocations (R_X86_64_PC64) present in crt1.o on newer
+    // glibc/gcc/binutils toolchains (e.g. Arch's rolling-release glibc
+    // 2.43+), and fails with "fatal linker error: unhandled relocation
+    // type ... crt1.o:.sframe". Fixed upstream in zig 0.17.0
+    // (ziglang/zig#31272). Force the LLVM backend+linker as a workaround
+    // until this host's zig is upgraded past 0.17.0 - safe to remove then.
+    exe.use_llvm = true;
+
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
         if (sqlite3) |lib| {
@@ -618,9 +627,11 @@ pub fn build(b: *std.Build) void {
     if (!is_wasi) {
         const compat_tests = b.addTest(.{ .root_module = compat_module });
         compat_tests.root_module.link_libc = true;
+        compat_tests.use_llvm = true; // see exe.use_llvm comment above
         test_step.dependOn(&b.addRunArtifact(compat_tests).step);
 
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
+        lib_tests.use_llvm = true; // see exe.use_llvm comment above
         if (sqlite3) |lib| {
             lib_tests.root_module.linkLibrary(lib);
         }
@@ -629,6 +640,7 @@ pub fn build(b: *std.Build) void {
         }
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+        exe_tests.use_llvm = true; // see exe.use_llvm comment above
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
