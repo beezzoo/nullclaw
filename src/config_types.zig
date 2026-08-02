@@ -621,6 +621,12 @@ pub const TelegramConfig = struct {
     /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
     /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
     draft_previews: bool = false,
+    /// Show the model's <think> reasoning as a transient Bot API 10.2
+    /// `Thinking` rich block while a draft is streaming. Only takes effect
+    /// when `streaming` and `draft_previews` are both enabled - the
+    /// Thinking block is a sendRichMessageDraft-only construct and can
+    /// never appear in the final persisted message. Disabled by default.
+    show_thinking_block: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Delete the triggering user message after the agent successfully processed it

@@ -684,6 +684,7 @@ pub const TelegramChannel = struct {
     draft_global_suppress_until_ms: i64 = 0,
     streaming_enabled: bool = true,
     draft_previews_enabled: bool = true,
+    show_thinking_block: bool = false,
     status_reactions_enabled: bool = false,
     delete_processed_targets: []const []const u8 = &.{},
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
@@ -752,6 +753,7 @@ pub const TelegramChannel = struct {
         ch.require_mention = cfg.require_mention;
         ch.streaming_enabled = cfg.streaming;
         ch.draft_previews_enabled = cfg.draft_previews;
+        ch.show_thinking_block = cfg.show_thinking_block;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.delete_processed_targets = cfg.delete_processed_targets;
         ch.reaction_emojis = cfg.reaction_emojis;
@@ -1528,6 +1530,21 @@ pub const TelegramChannel = struct {
         self.api().clearReplyMarkup(chat_id, message_id) catch return;
     }
 
+    /// Attempt the edit via Bot API 10.1 Rich Messages (`InputRichMessage.markdown`).
+    /// Returns true if it succeeded; false means the caller should fall back
+    /// to the existing HTML/plain edit path.
+    fn tryEditRichMessage(
+        self: *TelegramChannel,
+        target: []const u8,
+        message_id: i64,
+        text: []const u8,
+        reply_markup_json: ?[]const u8,
+    ) !bool {
+        const resp = self.api().editMessageTextRich(self.allocator, targetChatId(target), message_id, text, reply_markup_json) catch return false;
+        defer self.allocator.free(resp);
+        return !telegram_api.responseHasTelegramError(resp);
+    }
+
     fn editMessageWithMarkdownFallback(
         self: *TelegramChannel,
         target: []const u8,
@@ -1535,6 +1552,8 @@ pub const TelegramChannel = struct {
         text: []const u8,
         reply_markup_json: ?[]const u8,
     ) !void {
+        if (try self.tryEditRichMessage(target, message_id, text, reply_markup_json)) return;
+
         const html_text = markdownToTelegramHtml(self.allocator, text) catch {
             const resp = try self.api().editMessageText(self.allocator, targetChatId(target), message_id, text, reply_markup_json);
             defer self.allocator.free(resp);
@@ -1594,6 +1613,37 @@ pub const TelegramChannel = struct {
 
     // ── HTML fallback ────────────────────────────────────────────────
 
+    /// Attempt the send via Bot API 10.1 Rich Messages (`InputRichMessage.markdown`),
+    /// letting Telegram parse formatting server-side. Returns null if the rich
+    /// send couldn't be attempted or failed, so the caller falls back to the
+    /// existing HTML/plain send path.
+    fn trySendRichMessageWithMarkup(
+        self: *TelegramChannel,
+        target: []const u8,
+        text: []const u8,
+        reply_to: ?i64,
+        reply_markup_json: ?[]const u8,
+    ) !?SentMessageMeta {
+        const parsed_target = parseTelegramTarget(target);
+
+        const rich_body = telegram_api.buildSendRichMessageBody(
+            self.allocator,
+            parsed_target.chat_id,
+            parsed_target.message_thread_id,
+            reply_to,
+            reply_markup_json,
+            text,
+        ) catch return null;
+        defer self.allocator.free(rich_body);
+
+        const resp = self.api().sendRichMessage(self.allocator, rich_body) catch return null;
+        defer self.allocator.free(resp);
+
+        if (telegram_api.responseHasTelegramError(resp)) return null;
+
+        return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse SentMessageMeta{};
+    }
+
     /// Send text with HTML parse_mode (converted from Markdown); on failure, retry as plain text.
     fn sendWithMarkdownFallbackWithMarkup(
         self: *TelegramChannel,
@@ -1602,6 +1652,10 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
+        if (try self.trySendRichMessageWithMarkup(target, text, reply_to, reply_markup_json)) |meta| {
+            return meta;
+        }
+
         const parsed_target = parseTelegramTarget(target);
 
         // Convert Markdown → Telegram HTML
@@ -3105,7 +3159,7 @@ pub const TelegramChannel = struct {
         }
 
         if (pending_flush) |flush| {
-            self.sendDraft(target, flush.draft_id, flush.text, flush.started_at_ms);
+            self.sendDraft(target, flush.draft_id, flush.text, flush.thinking, flush.started_at_ms);
         }
     }
 
@@ -3191,15 +3245,53 @@ pub const TelegramChannel = struct {
         }
 
         if (pending_flush) |flush| {
-            self.sendDraft(chat_id, flush.draft_id, flush.text, flush.started_at_ms);
+            self.sendDraft(chat_id, flush.draft_id, flush.text, flush.thinking, flush.started_at_ms);
         }
     }
 
-    fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8, started_at_ms: i64) void {
+    /// Attempt the flush via Bot API 10.1 `sendRichMessageDraft`. When
+    /// `thinking_text` is present (and the binding opted in), it is carried
+    /// as an `InputRichBlockThinking` block alongside the visible text as a
+    /// paragraph block - the Thinking block can only ever appear here,
+    /// never in the final persisted message. Returns true on success; false
+    /// means the caller should fall back to the existing plain-text draft.
+    fn tryRichDraft(
+        self: *TelegramChannel,
+        parsed_target: ParsedTelegramTarget,
+        draft_id: u64,
+        visible_text: []const u8,
+        thinking_text: ?[]const u8,
+    ) bool {
+        const content: telegram_api.RichDraftContent = if (thinking_text) |t|
+            .{ .thinking = .{ .thinking = t, .visible = visible_text } }
+        else
+            .{ .markdown = visible_text };
+
+        const body = telegram_api.buildSendRichMessageDraftBody(
+            self.allocator,
+            parsed_target.chat_id,
+            parsed_target.message_thread_id,
+            draft_id,
+            content,
+        ) catch return false;
+        defer self.allocator.free(body);
+
+        const resp = self.api().sendRichMessageDraft(self.allocator, body) catch |err| {
+            log.warn("sendRichMessageDraft request failed: {}", .{err});
+            return false;
+        };
+        defer self.allocator.free(resp);
+
+        return !telegram_api.responseHasTelegramError(resp);
+    }
+
+    fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8, thinking: ?[]const u8, started_at_ms: i64) void {
         if (!self.draft_previews_enabled) return;
         if (builtin.is_test) return;
         if (!supportsDraftPreviewTarget(chat_id)) return;
-        if (!telegram_draft_presenter.hasVisibleDraftText(text)) return;
+
+        const show_thinking = self.show_thinking_block and thinking != null and telegram_draft_presenter.hasVisibleDraftText(thinking.?);
+        if (!telegram_draft_presenter.hasVisibleDraftText(text) and !show_thinking) return;
 
         const now_ms = std_compat.time.milliTimestamp();
         self.draft_send_mu.lock();
@@ -3208,6 +3300,8 @@ pub const TelegramChannel = struct {
         if (self.shouldSkipDraftSend(chat_id, draft_id, now_ms)) return;
 
         const parsed_target = parseTelegramTarget(chat_id);
+
+        if (self.tryRichDraft(parsed_target, draft_id, text, if (show_thinking) thinking.? else null)) return;
 
         const preview_text = telegram_draft_presenter.buildTransportText(
             self.allocator,
@@ -3310,7 +3404,7 @@ pub const TelegramChannel = struct {
                 }
 
                 if (pending_flush) |flush| {
-                    self.sendDraft(target, flush.draft_id, flush.text, flush.started_at_ms);
+                    self.sendDraft(target, flush.draft_id, flush.text, flush.thinking, flush.started_at_ms);
                 }
             },
             .final => {

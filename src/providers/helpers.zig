@@ -91,6 +91,42 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     return allocator.dupe(u8, trimmed);
 }
 
+test "splitThinkContent returns visible only when no think tags present" {
+    const result = try splitThinkContent(std.testing.allocator, "just an answer");
+    defer std.testing.allocator.free(result.visible);
+    defer if (result.reasoning) |r| std.testing.allocator.free(r);
+
+    try std.testing.expectEqualStrings("just an answer", result.visible);
+    try std.testing.expect(result.reasoning == null);
+}
+
+test "splitThinkContent separates a single think block from visible text" {
+    const result = try splitThinkContent(std.testing.allocator, "<think>pondering</think>the answer");
+    defer std.testing.allocator.free(result.visible);
+    defer if (result.reasoning) |r| std.testing.allocator.free(r);
+
+    try std.testing.expectEqualStrings("the answer", result.visible);
+    try std.testing.expectEqualStrings("pondering", result.reasoning.?);
+}
+
+test "splitThinkContent handles think block interleaved with visible text" {
+    const result = try splitThinkContent(std.testing.allocator, "before <think>reasoning</think> after");
+    defer std.testing.allocator.free(result.visible);
+    defer if (result.reasoning) |r| std.testing.allocator.free(r);
+
+    try std.testing.expectEqualStrings("before  after", result.visible);
+    try std.testing.expectEqualStrings("reasoning", result.reasoning.?);
+}
+
+test "splitThinkContent treats unclosed think tag as reasoning to end of text" {
+    const result = try splitThinkContent(std.testing.allocator, "visible <think>never closes");
+    defer std.testing.allocator.free(result.visible);
+    defer if (result.reasoning) |r| std.testing.allocator.free(r);
+
+    try std.testing.expectEqualStrings("visible", result.visible);
+    try std.testing.expectEqualStrings("never closes", result.reasoning.?);
+}
+
 fn appendReasoningDetailText(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,

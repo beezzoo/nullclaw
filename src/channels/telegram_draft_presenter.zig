@@ -29,11 +29,16 @@ pub const DraftState = struct {
 
 pub const DraftFlush = struct {
     draft_id: u64,
-    text: []u8,
+    text: []const u8,
+    /// Extracted <think>...</think> content, if any. Only ever carried by
+    /// rich draft flushes (InputRichBlockThinking is valid only in
+    /// sendRichMessageDraft, never in the final persisted message).
+    thinking: ?[]const u8 = null,
     started_at_ms: i64,
 
     pub fn deinit(self: *DraftFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
+        if (self.thinking) |t| allocator.free(t);
     }
 };
 
@@ -75,10 +80,16 @@ fn hasPendingVisibleDraft(state: *const DraftState) bool {
     return hasVisibleDraftText(state.buffer.items[state.last_flush_len..]);
 }
 
-fn snapshotDraftText(allocator: std.mem.Allocator, state: *const DraftState) ![]u8 {
-    const stripped = try providers.stripThinkBlocks(allocator, state.buffer.items);
-    defer allocator.free(stripped);
-    return allocator.dupe(u8, stripped);
+const DraftSnapshot = struct {
+    visible: []const u8,
+    thinking: ?[]const u8,
+};
+
+/// Splits the accumulated draft buffer into visible answer text and
+/// extracted reasoning, instead of discarding <think> content outright.
+fn snapshotDraftContent(allocator: std.mem.Allocator, state: *const DraftState) !DraftSnapshot {
+    const split = try providers.splitThinkContent(allocator, state.buffer.items);
+    return .{ .visible = split.visible, .thinking = split.reasoning };
 }
 
 fn alignUtf8Start(text: []const u8, start: usize) usize {
@@ -161,11 +172,12 @@ pub fn appendDraftChunk(
     if (!shouldFlushDraft(state, now_ms)) return null;
     if (!hasVisibleDraftText(state.buffer.items)) return null;
 
-    const text = try snapshotDraftText(allocator, state);
+    const snapshot = try snapshotDraftContent(allocator, state);
     markDraftFlushed(state, now_ms);
     return .{
         .draft_id = state.draft_id,
-        .text = text,
+        .text = snapshot.visible,
+        .thinking = snapshot.thinking,
         .started_at_ms = state.started_at_ms,
     };
 }
@@ -179,11 +191,12 @@ pub fn heartbeatDraft(
     if (millisSinceLastFlush(state, now_ms) < DRAFT_HEARTBEAT_INTERVAL_MS) return null;
 
     if (hasPendingVisibleDraft(state)) {
-        const text = try snapshotDraftText(allocator, state);
+        const snapshot = try snapshotDraftContent(allocator, state);
         markDraftFlushed(state, now_ms);
         return .{
             .draft_id = state.draft_id,
-            .text = text,
+            .text = snapshot.visible,
+            .thinking = snapshot.thinking,
             .started_at_ms = state.started_at_ms,
         };
     }
@@ -268,7 +281,7 @@ test "appendDraftChunk flushes visible content after interval" {
     try std.testing.expectEqual(@as(usize, 5), draft.last_flush_len);
 }
 
-test "appendDraftChunk strips think blocks from flushed draft" {
+test "appendDraftChunk splits think blocks into a separate thinking field" {
     var draft: DraftState = .{ .draft_id = 31 };
     defer draft.deinit(std.testing.allocator);
 
@@ -284,6 +297,45 @@ test "appendDraftChunk strips think blocks from flushed draft" {
     }
 
     try std.testing.expectEqualStrings("Visible answer", flush.text);
+    try std.testing.expectEqualStrings("private", flush.thinking.?);
+}
+
+test "appendDraftChunk flush has no thinking field when no think block present" {
+    var draft: DraftState = .{ .draft_id = 32 };
+    defer draft.deinit(std.testing.allocator);
+
+    const flush = (try appendDraftChunk(
+        std.testing.allocator,
+        &draft,
+        "just an answer",
+        DRAFT_FLUSH_MIN_INTERVAL_MS + 1,
+    )) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqualStrings("just an answer", flush.text);
+    try std.testing.expect(flush.thinking == null);
+}
+
+test "appendDraftChunk flushes an in-progress thinking block with empty visible text" {
+    var draft: DraftState = .{ .draft_id = 33 };
+    defer draft.deinit(std.testing.allocator);
+
+    const flush = (try appendDraftChunk(
+        std.testing.allocator,
+        &draft,
+        "<think>still pondering",
+        DRAFT_FLUSH_MIN_INTERVAL_MS + 1,
+    )) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqualStrings("", flush.text);
+    try std.testing.expectEqualStrings("still pondering", flush.thinking.?);
 }
 
 test "appendDraftChunk stays quiet while suppressed" {

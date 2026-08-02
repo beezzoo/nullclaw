@@ -244,6 +244,50 @@ pub const Client = struct {
         return self.post(allocator, "sendMessageDraft", body, "10");
     }
 
+    /// Send a message via Bot API 10.1 Rich Messages (`InputRichMessage`).
+    /// `body` must be a pre-built JSON body containing `chat_id` and `rich_message`.
+    pub fn sendRichMessage(self: Client, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        return self.post(allocator, "sendRichMessage", body, "30");
+    }
+
+    /// Stream a partial rich message (Bot API 10.1). The streamed draft is
+    /// ephemeral (~30s preview) - the caller must still call `sendRichMessage`
+    /// with the final content to persist it.
+    pub fn sendRichMessageDraft(self: Client, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        return self.post(allocator, "sendRichMessageDraft", body, "10");
+    }
+
+    pub fn editMessageTextRich(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, message_id: i64, markdown: []const u8, reply_markup_json: ?[]const u8) ![]u8 {
+        const body = try buildEditRichMessageTextBody(allocator, chat_id, message_id, markdown, reply_markup_json);
+        defer allocator.free(body);
+        return self.post(allocator, "editMessageText", body, "30");
+    }
+
+    fn buildEditRichMessageTextBody(
+        allocator: std.mem.Allocator,
+        chat_id: []const u8,
+        message_id: i64,
+        markdown: []const u8,
+        reply_markup_json: ?[]const u8,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try body.appendSlice(allocator, chat_id);
+
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(allocator, ",\"message_id\":");
+        try body.appendSlice(allocator, msg_id_str);
+        try body.appendSlice(allocator, ",");
+        try appendInputRichMessageMarkdown(&body, allocator, markdown);
+        try appendRawReplyMarkup(&body, allocator, reply_markup_json);
+        try body.appendSlice(allocator, "}");
+
+        return body.toOwnedSlice(allocator);
+    }
+
     pub fn getFilePath(self: Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -401,6 +445,99 @@ pub fn appendRawReplyMarkup(body: *std.ArrayListUnmanaged(u8), allocator: std.me
         try body.appendSlice(allocator, ",\"reply_markup\":");
         try body.appendSlice(allocator, rm);
     }
+}
+
+// ── InputRichMessage (Bot API 10.1/10.2) ────────────────────────────────
+//
+// Schema verified against PaulSonOfLars/telegram-bot-api-spec's api.min.json
+// (regenerated 2026-07-20, "Bot API 10.2 July 14, 2026"): InputRichMessage
+// has fields `blocks`, `html`, `markdown` (exactly one used), `media`,
+// `is_rtl`, `skip_entity_detection`. InputRichBlockThinking may only be
+// used inside sendRichMessageDraft ("can't be received in messages"), so it
+// is only ever emitted via appendInputRichMessageThinkingBlocks, never for
+// sendRichMessage/editMessageText.
+
+/// Appends `"rich_message":{"markdown":"..."}` — lets Telegram parse
+/// formatting server-side instead of nullclaw's own markdown-to-HTML pass.
+pub fn appendInputRichMessageMarkdown(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, markdown: []const u8) !void {
+    try body.appendSlice(allocator, "\"rich_message\":{\"markdown\":");
+    try root.json_util.appendJsonString(body, allocator, markdown);
+    try body.appendSlice(allocator, "}");
+}
+
+pub const RichThinkingBlocks = struct {
+    thinking: []const u8,
+    visible: []const u8,
+};
+
+/// Appends `"rich_message":{"blocks":[{"type":"thinking",...},{"type":"paragraph",...}]}`.
+/// `blocks` and `markdown` are mutually exclusive on InputRichMessage, so
+/// this is used only for draft flushes carrying in-progress reasoning -
+/// InputRichBlockThinking is not valid outside sendRichMessageDraft.
+pub fn appendInputRichMessageThinkingBlocks(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, blocks: RichThinkingBlocks) !void {
+    try body.appendSlice(allocator, "\"rich_message\":{\"blocks\":[{\"type\":\"thinking\",\"text\":");
+    try root.json_util.appendJsonString(body, allocator, blocks.thinking);
+    try body.appendSlice(allocator, "},{\"type\":\"paragraph\",\"text\":");
+    try root.json_util.appendJsonString(body, allocator, blocks.visible);
+    try body.appendSlice(allocator, "}]}");
+}
+
+pub fn buildSendRichMessageBody(
+    allocator: std.mem.Allocator,
+    chat_id: []const u8,
+    message_thread_id: ?i64,
+    reply_to: ?i64,
+    reply_markup_json: ?[]const u8,
+    markdown: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, chat_id);
+    try appendMessageThreadId(&body, allocator, message_thread_id);
+    try body.appendSlice(allocator, ",");
+    try appendInputRichMessageMarkdown(&body, allocator, markdown);
+    try appendReplyTo(&body, allocator, reply_to);
+    try appendRawReplyMarkup(&body, allocator, reply_markup_json);
+    try body.appendSlice(allocator, "}");
+
+    return body.toOwnedSlice(allocator);
+}
+
+/// Content of a `sendRichMessageDraft` flush: either plain markdown, or a
+/// thinking+paragraph block pair. `InputRichMessage.blocks` and `.markdown`
+/// are mutually exclusive, so this mirrors that at the type level.
+pub const RichDraftContent = union(enum) {
+    markdown: []const u8,
+    thinking: RichThinkingBlocks,
+};
+
+pub fn buildSendRichMessageDraftBody(
+    allocator: std.mem.Allocator,
+    chat_id: []const u8,
+    message_thread_id: ?i64,
+    draft_id: u64,
+    content: RichDraftContent,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, chat_id);
+    try body.appendSlice(allocator, ",\"draft_id\":");
+    var id_buf: [20]u8 = undefined;
+    const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{draft_id});
+    try body.appendSlice(allocator, id_str);
+    try appendMessageThreadId(&body, allocator, message_thread_id);
+    try body.appendSlice(allocator, ",");
+    switch (content) {
+        .markdown => |md| try appendInputRichMessageMarkdown(&body, allocator, md),
+        .thinking => |blocks| try appendInputRichMessageThinkingBlocks(&body, allocator, blocks),
+    }
+    try body.appendSlice(allocator, "}");
+
+    return body.toOwnedSlice(allocator);
 }
 
 pub fn responseHasTelegramError(resp: []const u8) bool {
@@ -571,4 +708,79 @@ test "telegram api buildEditMessageTextBody omits parse mode for plain edits" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"plain text\"") != null);
+}
+
+test "telegram api buildSendRichMessageBody uses markdown field" {
+    const body = try buildSendRichMessageBody(
+        std.testing.allocator,
+        "12345",
+        null,
+        null,
+        null,
+        "**bold** text",
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"rich_message\":{\"markdown\":\"**bold** text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"blocks\"") == null);
+}
+
+test "telegram api buildSendRichMessageBody includes reply_to and reply_markup" {
+    const body = try buildSendRichMessageBody(
+        std.testing.allocator,
+        "12345",
+        77,
+        99,
+        "{\"inline_keyboard\":[]}",
+        "hi",
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_thread_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reply_parameters\":{\"message_id\":99}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reply_markup\":{\"inline_keyboard\":[]}") != null);
+}
+
+test "telegram api buildEditRichMessageTextBody uses rich_message not text" {
+    const body = try Client.buildEditRichMessageTextBody(
+        std.testing.allocator,
+        "12345",
+        42,
+        "_italic_",
+        null,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_id\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"rich_message\":{\"markdown\":\"_italic_\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":") == null);
+}
+
+test "telegram api buildSendRichMessageDraftBody markdown mode" {
+    const body = try buildSendRichMessageDraftBody(
+        std.testing.allocator,
+        "12345",
+        null,
+        7,
+        .{ .markdown = "partial answer" },
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_id\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"rich_message\":{\"markdown\":\"partial answer\"}") != null);
+}
+
+test "telegram api buildSendRichMessageDraftBody thinking mode carries both blocks" {
+    const body = try buildSendRichMessageDraftBody(
+        std.testing.allocator,
+        "12345",
+        null,
+        7,
+        .{ .thinking = .{ .thinking = "pondering...", .visible = "partial answer" } },
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"blocks\":[{\"type\":\"thinking\",\"text\":\"pondering...\"},{\"type\":\"paragraph\",\"text\":\"partial answer\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"markdown\"") == null);
 }
