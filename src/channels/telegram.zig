@@ -1540,9 +1540,16 @@ pub const TelegramChannel = struct {
         text: []const u8,
         reply_markup_json: ?[]const u8,
     ) !bool {
-        const resp = self.api().editMessageTextRich(self.allocator, targetChatId(target), message_id, text, reply_markup_json) catch return false;
+        const resp = self.api().editMessageTextRich(self.allocator, targetChatId(target), message_id, text, reply_markup_json) catch |err| {
+            log.warn("editMessageTextRich request failed, falling back to HTML/plain: {}", .{err});
+            return false;
+        };
         defer self.allocator.free(resp);
-        return !telegram_api.responseHasTelegramError(resp);
+        const ok = !telegram_api.responseHasTelegramError(resp);
+        if (!ok) {
+            log.warn("editMessageTextRich API error, falling back to HTML/plain: {s}", .{util.previewUtf8(resp, 256).slice});
+        }
+        return ok;
     }
 
     fn editMessageWithMarkdownFallback(
@@ -1633,13 +1640,22 @@ pub const TelegramChannel = struct {
             reply_to,
             reply_markup_json,
             text,
-        ) catch return null;
+        ) catch |err| {
+            log.warn("sendRichMessage body construction failed, falling back to HTML/plain: {}", .{err});
+            return null;
+        };
         defer self.allocator.free(rich_body);
 
-        const resp = self.api().sendRichMessage(self.allocator, rich_body) catch return null;
+        const resp = self.api().sendRichMessage(self.allocator, rich_body) catch |err| {
+            log.warn("sendRichMessage request failed, falling back to HTML/plain: {}", .{err});
+            return null;
+        };
         defer self.allocator.free(resp);
 
-        if (telegram_api.responseHasTelegramError(resp)) return null;
+        if (telegram_api.responseHasTelegramError(resp)) {
+            log.warn("sendRichMessage API error, falling back to HTML/plain: {s}", .{util.previewUtf8(resp, 256).slice});
+            return null;
+        }
 
         return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse SentMessageMeta{};
     }
@@ -3273,16 +3289,23 @@ pub const TelegramChannel = struct {
             parsed_target.message_thread_id,
             draft_id,
             content,
-        ) catch return false;
+        ) catch |err| {
+            log.warn("sendRichMessageDraft body construction failed, falling back to plain: {}", .{err});
+            return false;
+        };
         defer self.allocator.free(body);
 
         const resp = self.api().sendRichMessageDraft(self.allocator, body) catch |err| {
-            log.warn("sendRichMessageDraft request failed: {}", .{err});
+            log.warn("sendRichMessageDraft request failed, falling back to plain: {}", .{err});
             return false;
         };
         defer self.allocator.free(resp);
 
-        return !telegram_api.responseHasTelegramError(resp);
+        const ok = !telegram_api.responseHasTelegramError(resp);
+        if (!ok) {
+            log.warn("sendRichMessageDraft API error, falling back to plain: {s}", .{util.previewUtf8(resp, 256).slice});
+        }
+        return ok;
     }
 
     fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8, thinking: ?[]const u8, started_at_ms: i64) void {
