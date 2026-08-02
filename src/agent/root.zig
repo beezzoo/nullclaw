@@ -1106,6 +1106,12 @@ pub const Agent = struct {
         return false;
     }
 
+    fn responseClaimsCompletion(text: []const u8) bool {
+        // Checks for the ✅ completion marker (U+2705, UTF-8: 0xE2 0x9C 0x85).
+        // Agents use this universally to signal a completed action.
+        return std.mem.indexOf(u8, text, "\xe2\x9c\x85") != null;
+    }
+
     fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0 or haystack.len < needle.len) return false;
         var i: usize = 0;
@@ -2170,6 +2176,8 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
+        var turn_tools_called: u32 = 0;
+        var no_tool_correction_count: u32 = 0;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
@@ -2583,6 +2591,23 @@ pub const Agent = struct {
                     continue;
                 }
 
+                // Guardrail: response claims a completed action (✅) but no tools were
+                // called this turn — re-enter loop once to force actual execution.
+                if (no_tool_correction_count < 1 and
+                    turn_tools_called == 0 and
+                    self.tool_specs.len > 0 and
+                    iteration + 1 < self.max_tool_iterations and
+                    responseClaimsCompletion(display_text))
+                {
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You reported a completed action (\u{2705}) but did not call any tools in this turn. " ++
+                        "Either execute the action now using the available tool(s), or explain why it cannot be done.") });
+                    self.trimHistory();
+                    self.freeResponseFields(&response);
+                    no_tool_correction_count += 1;
+                    continue;
+                }
+
                 // If an inbound message arrived while the final model response
                 // was being produced, fold it into this active turn instead of
                 // leaving it buffered until an unrelated future message.
@@ -2787,6 +2812,7 @@ pub const Agent = struct {
                 self.observer.recordEvent(&tool_event);
 
                 try results_buf.append(self.allocator, result);
+                turn_tools_called += 1;
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
