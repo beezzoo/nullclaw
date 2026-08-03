@@ -108,8 +108,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
     .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
     .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
@@ -794,8 +794,6 @@ test "findCompatProvider returns correct flags" {
     const native_tool_aliases = [_][]const u8{
         "glm",
         "zhipu",
-        "zai",
-        "z.ai",
         "glm-cn",
         "zhipu-cn",
         "bigmodel",
@@ -810,6 +808,15 @@ test "findCompatProvider returns correct flags" {
         const provider = findCompatProvider(provider_name).?;
         try std.testing.expect(provider.native_tools);
         try std.testing.expect(provider.disable_streaming);
+        try std.testing.expect(provider.thinking_param);
+    }
+
+    // zai/z.ai (coding endpoint) allow streaming but keep thinking_param
+    const zai_streaming_aliases = [_][]const u8{ "zai", "z.ai" };
+    for (zai_streaming_aliases) |provider_name| {
+        const provider = findCompatProvider(provider_name).?;
+        try std.testing.expect(provider.native_tools);
+        try std.testing.expect(!provider.disable_streaming);
         try std.testing.expect(provider.thinking_param);
     }
 
@@ -893,8 +900,6 @@ test "fromConfig disables streaming for z.ai/glm aliases" {
     const native_tool_aliases = [_][]const u8{
         "glm",
         "zhipu",
-        "zai",
-        "z.ai",
         "glm-cn",
         "zhipu-cn",
         "bigmodel",
@@ -912,6 +917,25 @@ test "fromConfig disables streaming for z.ai/glm aliases" {
         try std.testing.expect(holder == .compatible);
         try std.testing.expect(holder.compatible.disable_streaming);
         try std.testing.expect(!holder.provider().supportsStreaming());
+    }
+}
+
+test "fromConfig allows streaming for zai/z.ai coding-endpoint aliases" {
+    const alloc = std.testing.allocator;
+    const streaming_aliases = [_][]const u8{
+        "zai",
+        "z.ai",
+    };
+
+    for (streaming_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, true, null, null, false, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(!holder.compatible.disable_streaming);
+        try std.testing.expect(holder.provider().supportsStreaming());
+        // thinking_param must still be applied — streaming does not disable
+        // explicit reasoning_effort control for these aliases.
+        try std.testing.expect(holder.compatible.thinking_param);
     }
 }
 
