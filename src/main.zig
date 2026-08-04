@@ -6526,6 +6526,33 @@ test "hasStartupProviderCredentials rejects blank configured key" {
 
 test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
     // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    // Isolate from ambient ANTHROPIC_OAUTH_TOKEN/ANTHROPIC_API_KEY (e.g. set in the host
+    // shell for unrelated tooling) — otherwise this test silently stops exercising the
+    // "no credentials configured" path it exists to guard, and save/restore rather than
+    // just unset so we don't clobber a value some other process in this environment relies on.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const oauth_name_z = try std.testing.allocator.dupeZ(u8, "ANTHROPIC_OAUTH_TOKEN");
+    defer std.testing.allocator.free(oauth_name_z);
+    const saved_oauth: ?[:0]u8 = if (c.getenv(oauth_name_z.ptr)) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer if (saved_oauth) |v| std.testing.allocator.free(v);
+    _ = c.unsetenv(oauth_name_z.ptr);
+    defer if (saved_oauth) |v| {
+        _ = c.setenv(oauth_name_z.ptr, v.ptr, 1);
+    };
+
+    const key_name_z = try std.testing.allocator.dupeZ(u8, "ANTHROPIC_API_KEY");
+    defer std.testing.allocator.free(key_name_z);
+    const saved_key: ?[:0]u8 = if (c.getenv(key_name_z.ptr)) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer if (saved_key) |v| std.testing.allocator.free(v);
+    _ = c.unsetenv(key_name_z.ptr);
+    defer if (saved_key) |v| {
+        _ = c.setenv(key_name_z.ptr, v.ptr, 1);
+    };
+
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
