@@ -8,10 +8,13 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 
 ## Spec-Driven Development (OpenSpec)
 
-This clone is a local fork behind `~/.nullclaw-locus` (the running agent instance) — every code change here exists to serve that instance. Development is planned through OpenSpec, but this repo does **not** own its own spec set: it targets the `nullclaw-locus` store.
+This clone is a personal fork (`git@github.com:beezzoo/nullclaw.git`, remote `origin`) tracking `upstream` = `https://github.com/nullclaw/nullclaw.git`, behind `~/.nullclaw-locus` (the running agent instance) — every code change here exists to serve that instance. Development is planned through OpenSpec, but this repo does **not** own its own spec set: it targets the `nullclaw-locus` store.
 
 - Always pass `--store nullclaw-locus` on `openspec` commands run from this repo (`/opsx:propose`, `/opsx:apply`, `openspec list`, etc.) — there is no local `openspec/` directory here by design, so omitting the flag resolves the wrong (or no) root.
-- A change proposed and planned in the `nullclaw-locus` store may require editing this repo's Zig source. When it does: implement here, validate with `zig build test --summary all`, then save the diff as `~/.nullclaw-locus/patches/<name>.patch` (`git diff -- <file> > ...`) and commit both here (`local: apply <name>.patch`) and in `~/.nullclaw-locus` (adds the tracked `.patch` file) — this is the existing convention for the 15+ local patches already in this repo's history (`git log --oneline origin/main..HEAD`).
+- **Branch model**: `main` is a clean mirror of `upstream/main` — never commit here directly. `locus` is the working branch — all code changes for this instance go directly on `locus` as normal commits (no `.patch`-file mirroring into `~/.nullclaw-locus/patches/` anymore; that convention is deprecated, see `~/.nullclaw-locus/patches/README.md`). `~/Downloads/nullclaw` should have `locus` checked out day-to-day (that's what `nullclaw-rebuild.sh` builds).
+- A change proposed and planned in the `nullclaw-locus` store may require editing this repo's Zig source. When it does: implement on `locus`, validate with `zig build test --summary all`, commit normally, `git push origin locus`. Reference the commit SHA in the change's `tasks.md` in `nullclaw-locus` for traceability (no local artifact otherwise ties the two repos together).
+- Updating from upstream: `git checkout main && git fetch upstream && git merge --ff-only upstream/main && git push origin main`, then `git checkout locus && git rebase main` (resolve conflicts here, not silently at build time) and `git push origin locus --force-with-lease`.
+- Upstream PR: for a `locus` commit that's a self-contained fix with no instance-specific behavior, `git checkout -b fix/<name> upstream/main`, `git cherry-pick <sha>`, `git push origin fix/<name>`, open a PR `beezzoo:fix/<name> → nullclaw:main`.
 - Deploying a change: `~/.local/bin/nullclaw-rebuild.sh` (runs the test suite, builds `ReleaseSmall`, replaces `~/.local/bin/nullclaw`, restarts `nullclaw.service`).
 
 ## Build & Test Commands
