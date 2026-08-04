@@ -2393,12 +2393,31 @@ pub const TelegramChannel = struct {
         return buf.toOwnedSlice(allocator) catch null;
     }
 
+    /// `Message.rich_message` (Bot API 10.1+) is what's actually populated
+    /// when a checklist reaches the chat via Telegram's Rich Message UI
+    /// (confirmed via a live captured inbound update — this is a different,
+    /// more general field than `Message.checklist` above, and is the one
+    /// that matters for the originally reported bug: a pasted
+    /// deadline-nudge.py checklist produced zero agent reaction and zero
+    /// log output because neither `Message.checklist` nor `text`/`caption`
+    /// was present).
+    fn resolveRichMessageContent(allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const rm = telegram_update_ingress.richMessage(message) orelse return null;
+        const flattened = telegram_update_ingress.synthesizeRichMessageText(allocator, rm) catch return null;
+        if (flattened.len == 0) {
+            allocator.free(flattened);
+            return null;
+        }
+        return flattened;
+    }
+
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
         const base = self.resolveVoiceOrAudioContent(allocator, message) orelse
             self.resolvePhotoContent(allocator, message) orelse
             self.resolveDocumentContent(allocator, message) orelse
             resolveChecklistContent(allocator, message) orelse
             resolveChecklistTasksDoneContent(allocator, message) orelse
+            resolveRichMessageContent(allocator, message) orelse
             telegram_update_ingress.textOrCaption(allocator, message);
 
         const base_content = base orelse return null;

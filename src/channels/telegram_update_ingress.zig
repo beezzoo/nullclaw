@@ -252,6 +252,108 @@ pub fn synthesizeChecklistMarkdown(
     return buf.toOwnedSlice(allocator);
 }
 
+// ── Rich Message (Bot API 10.1+, Message.rich_message) ──────────────────
+//
+// This is the field actually populated when a message carries a checklist
+// composed/forwarded through Telegram's Rich Message UI (confirmed via a
+// live captured inbound update this session) — NOT the older, narrower
+// `Message.checklist`/`ChecklistTask` object above. Both are kept: they're
+// independently documented Bot API 10.2 types and may both occur depending
+// on how a checklist reaches the chat.
+
+fn boolField(value: std.json.Value, key: []const u8) bool {
+    const field = objectField(value, key) orelse return false;
+    return field == .bool and field.bool;
+}
+
+/// Returns the `rich_message` object of `message` when present ("Message
+/// is a rich formatted message").
+pub fn richMessage(message: std.json.Value) ?std.json.Value {
+    const value = objectField(message, "rich_message") orelse return null;
+    return if (value == .object) value else null;
+}
+
+/// Flattens a `RichText` value (String | Array of RichText | an object
+/// wrapping an inner `text` field, e.g. RichTextBold/RichTextItalic) into
+/// plain text. Formatting spans are unwrapped to their inner text —
+/// markers are dropped, the agent just needs readable text.
+fn appendRichText(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: std.json.Value) !void {
+    switch (value) {
+        .string => |s| try buf.appendSlice(allocator, s),
+        .array => |arr| for (arr.items) |item| try appendRichText(buf, allocator, item),
+        .object => if (objectField(value, "text")) |inner| try appendRichText(buf, allocator, inner),
+        else => {},
+    }
+}
+
+/// Appends one RichBlockListItem's own text (its `blocks`, flattened).
+/// Multiple paragraph blocks within one item are joined with a space —
+/// checklist items are normally a single paragraph. Other nested block
+/// types (sub-lists, tables, etc.) inside a single item are not flattened
+/// here — the common case (one paragraph per item) is what this covers.
+fn appendListItemText(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, item_blocks: std.json.Value) !void {
+    if (item_blocks != .array) return;
+    var wrote = false;
+    for (item_blocks.array.items) |block| {
+        if (block != .object) continue;
+        const block_type = stringField(block, "type") orelse continue;
+        if (std.mem.eql(u8, block_type, "paragraph")) {
+            const text_val = objectField(block, "text") orelse continue;
+            if (wrote) try buf.appendSlice(allocator, " ");
+            try appendRichText(buf, allocator, text_val);
+            wrote = true;
+        }
+    }
+}
+
+/// Flattens top-level RichBlocks into markdown text: paragraphs as plain
+/// lines, lists as `- [ ]`/`- [x]`/`- ` items (matching the outbound
+/// checklist convention), separated by blank lines between blocks. Other
+/// block types (table, heading, divider, etc.) are intentionally skipped —
+/// this change targets checklist content specifically.
+fn appendRichBlocks(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, blocks: std.json.Value) !void {
+    if (blocks != .array) return;
+    for (blocks.array.items) |block| {
+        if (block != .object) continue;
+        const block_type = stringField(block, "type") orelse continue;
+
+        if (std.mem.eql(u8, block_type, "paragraph")) {
+            const text_val = objectField(block, "text") orelse continue;
+            if (buf.items.len > 0) try buf.appendSlice(allocator, "\n\n");
+            try appendRichText(buf, allocator, text_val);
+        } else if (std.mem.eql(u8, block_type, "list")) {
+            const items_val = objectField(block, "items") orelse continue;
+            if (items_val != .array) continue;
+            if (buf.items.len > 0) try buf.appendSlice(allocator, "\n\n");
+            for (items_val.array.items, 0..) |item, i| {
+                if (item != .object) continue;
+                if (i > 0) try buf.appendSlice(allocator, "\n");
+                if (boolField(item, "has_checkbox")) {
+                    try buf.appendSlice(allocator, if (boolField(item, "is_checked")) "- [x] " else "- [ ] ");
+                } else {
+                    try buf.appendSlice(allocator, "- ");
+                }
+                if (objectField(item, "blocks")) |item_blocks| {
+                    try appendListItemText(buf, allocator, item_blocks);
+                }
+            }
+        }
+        // else: other block types intentionally skipped (see doc comment).
+    }
+}
+
+/// Synthesizes markdown text from an inbound `Message.rich_message`
+/// (paragraphs and checkbox/plain lists — see `appendRichBlocks`). Returns
+/// an empty (non-null) string if `blocks` is absent or empty. Caller owns
+/// the returned slice.
+pub fn synthesizeRichMessageText(allocator: std.mem.Allocator, rich_message_val: std.json.Value) ![]u8 {
+    const blocks = objectField(rich_message_val, "blocks") orelse return try allocator.dupe(u8, "");
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendRichBlocks(&buf, allocator, blocks);
+    return buf.toOwnedSlice(allocator);
+}
+
 pub fn text(message: std.json.Value) ?[]const u8 {
     return stringField(message, "text");
 }
@@ -565,6 +667,89 @@ test "checklistTasksDoneMessage returns null when checklist_message is absent" {
     defer allocator.free(done_ids);
     try std.testing.expectEqual(@as(usize, 1), done_ids.len);
     try std.testing.expectEqual(@as(i64, 5), done_ids[0]);
+}
+
+test "richMessage flattens paragraph + checklist blocks to markdown (regression: pasted nudge checklist silently dropped)" {
+    // Trimmed version of a real captured inbound update: the user pasted a
+    // deadline-nudge.py checklist back into a message with one item
+    // checked. Before this fix, resolveMessageContent found neither
+    // text/caption nor Message.checklist and silently dropped the update.
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"rich_message":{"blocks":[
+        \\  {"type":"paragraph","text":"🎯 Контроль сроков — дожимаю:"},
+        \\  {"type":"list","items":[
+        \\    {"label":"•","blocks":[{"type":"paragraph","text":["🔴"," «Задача A» — просрочено"]}],"has_checkbox":true},
+        \\    {"label":"•","blocks":[{"type":"paragraph","text":"«Задача B» — срок сегодня"}],"has_checkbox":true,"is_checked":true}
+        \\  ]},
+        \\  {"type":"paragraph","text":"Когда сделаешь — закрой задачу."}
+        \\]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const rm = richMessage(parsed.value) orelse return error.TestExpectedEqual;
+    const flattened = try synthesizeRichMessageText(allocator, rm);
+    defer allocator.free(flattened);
+    try std.testing.expectEqualStrings(
+        "🎯 Контроль сроков — дожимаю:" ++
+            "\n\n- [ ] 🔴 «Задача A» — просрочено\n- [x] «Задача B» — срок сегодня" ++
+            "\n\nКогда сделаешь — закрой задачу.",
+        flattened,
+    );
+}
+
+test "richMessage flattens non-checkbox list items with a plain bullet" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"rich_message":{"blocks":[{"type":"list","items":[
+        \\  {"label":"•","blocks":[{"type":"paragraph","text":"Просто пункт"}]}
+        \\]}]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const rm = richMessage(parsed.value) orelse return error.TestExpectedEqual;
+    const flattened = try synthesizeRichMessageText(allocator, rm);
+    defer allocator.free(flattened);
+    try std.testing.expectEqualStrings("- Просто пункт", flattened);
+}
+
+test "richMessage unwraps bold/formatted RichText spans to plain text" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"rich_message":{"blocks":[{"type":"paragraph","text":[{"type":"bold","text":"Итого:"}," 100"]}]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const rm = richMessage(parsed.value) orelse return error.TestExpectedEqual;
+    const flattened = try synthesizeRichMessageText(allocator, rm);
+    defer allocator.free(flattened);
+    try std.testing.expectEqualStrings("Итого: 100", flattened);
+}
+
+test "richMessage returns null when message has no rich_message field" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"text":"plain message"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(richMessage(parsed.value) == null);
 }
 
 test "replyToText returns text of replied-to message (regression #916)" {
