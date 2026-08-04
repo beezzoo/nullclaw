@@ -2308,10 +2308,97 @@ pub const TelegramChannel = struct {
         );
     }
 
+    /// Renders one `label` line naming the ids in `ids`, resolving each id
+    /// to its task text via `tasks` when available, falling back to `#<id>`
+    /// otherwise (e.g. when `checklist_message` was absent upstream).
+    fn appendTaskIdsLine(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        label: []const u8,
+        ids: []const i64,
+        tasks: ?[]const telegram_update_ingress.ChecklistTaskInfo,
+    ) !void {
+        if (ids.len == 0) return;
+        try buf.appendSlice(allocator, "\n");
+        try buf.appendSlice(allocator, label);
+        for (ids, 0..) |id, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            const found: ?[]const u8 = blk: {
+                const list = tasks orelse break :blk null;
+                for (list) |t| {
+                    if (t.id == id) break :blk t.text;
+                }
+                break :blk null;
+            };
+            if (found) |task_text| {
+                try buf.appendSlice(allocator, task_text);
+            } else {
+                var id_buf: [24]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&id_buf, "#{d}", .{id}) catch continue;
+                try buf.appendSlice(allocator, id_str);
+            }
+        }
+    }
+
+    /// A message that is itself a checklist (`Message.checklist`, Bot API
+    /// 10.2) carries no `text`/`caption` — synthesize the same `- [ ]`/
+    /// `- [x]` markdown the outbound path already uses, so the agent sees
+    /// familiar syntax instead of the update being silently dropped.
+    fn resolveChecklistContent(allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const cl = telegram_update_ingress.checklist(message) orelse return null;
+        const title = telegram_update_ingress.checklistTitle(cl) orelse "";
+        const tasks = telegram_update_ingress.checklistTasks(allocator, cl) catch return null;
+        defer allocator.free(tasks);
+        return telegram_update_ingress.synthesizeChecklistMarkdown(allocator, title, tasks) catch null;
+    }
+
+    /// `Message.checklist_tasks_done` is the service message Telegram sends
+    /// when someone toggles a task's completion state on an existing
+    /// checklist message (including one nullclaw itself sent, e.g. a
+    /// deadline-nudge.py nudge). It also carries no `text`/`caption`.
+    /// `checklist_message` holds the checklist's complete, current state,
+    /// so no lookup by message id is needed.
+    fn resolveChecklistTasksDoneContent(allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const ctd = telegram_update_ingress.checklistTasksDone(message) orelse return null;
+
+        const done_ids = telegram_update_ingress.checklistTasksDoneMarkedDone(allocator, ctd) catch return null;
+        defer allocator.free(done_ids);
+        const not_done_ids = telegram_update_ingress.checklistTasksDoneMarkedNotDone(allocator, ctd) catch return null;
+        defer allocator.free(not_done_ids);
+
+        const cl_message = telegram_update_ingress.checklistTasksDoneMessage(ctd);
+        const cl = if (cl_message) |m| telegram_update_ingress.checklist(m) else null;
+        const tasks: ?[]telegram_update_ingress.ChecklistTaskInfo = if (cl) |c|
+            (telegram_update_ingress.checklistTasks(allocator, c) catch null)
+        else
+            null;
+        defer if (tasks) |t| allocator.free(t);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        buf.appendSlice(allocator, "[Checklist update]") catch return null;
+        appendTaskIdsLine(&buf, allocator, "Marked done: ", done_ids, tasks) catch return null;
+        appendTaskIdsLine(&buf, allocator, "Marked not done: ", not_done_ids, tasks) catch return null;
+
+        if (cl) |c| {
+            if (tasks) |t| {
+                const title = telegram_update_ingress.checklistTitle(c) orelse "";
+                const md = telegram_update_ingress.synthesizeChecklistMarkdown(allocator, title, t) catch return null;
+                defer allocator.free(md);
+                buf.appendSlice(allocator, "\n\nCurrent state:\n\n") catch return null;
+                buf.appendSlice(allocator, md) catch return null;
+            }
+        }
+
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
         const base = self.resolveVoiceOrAudioContent(allocator, message) orelse
             self.resolvePhotoContent(allocator, message) orelse
             self.resolveDocumentContent(allocator, message) orelse
+            resolveChecklistContent(allocator, message) orelse
+            resolveChecklistTasksDoneContent(allocator, message) orelse
             telegram_update_ingress.textOrCaption(allocator, message);
 
         const base_content = base orelse return null;

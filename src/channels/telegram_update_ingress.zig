@@ -28,6 +28,14 @@ pub const DocumentInfo = struct {
     file_size: ?i64,
 };
 
+pub const ChecklistTaskInfo = struct {
+    id: i64,
+    /// Non-owned slice into the parsed JSON tree — valid as long as the
+    /// caller keeps the underlying std.json.Parsed alive.
+    text: []const u8,
+    completed: bool,
+};
+
 pub const VoiceOrAudioKind = enum {
     voice,
     audio,
@@ -144,6 +152,104 @@ pub fn documentInfo(message: std.json.Value) ?DocumentInfo {
         .mime_type = stringField(doc_val, "mime_type"),
         .file_size = integerField(doc_val, "file_size"),
     };
+}
+
+/// Returns the `checklist` object of `message` when present (Bot API 10.2:
+/// "Message is a checklist").
+pub fn checklist(message: std.json.Value) ?std.json.Value {
+    const value = objectField(message, "checklist") orelse return null;
+    return if (value == .object) value else null;
+}
+
+/// Title of a `Checklist` value (see `checklist`).
+pub fn checklistTitle(checklist_val: std.json.Value) ?[]const u8 {
+    return stringField(checklist_val, "title");
+}
+
+/// Tasks of a `Checklist` value as a caller-owned slice (free with
+/// `allocator.free`). Each task's `text` is a non-owned slice into the
+/// parsed JSON tree.
+pub fn checklistTasks(allocator: std.mem.Allocator, checklist_val: std.json.Value) ![]ChecklistTaskInfo {
+    const tasks_val = objectField(checklist_val, "tasks") orelse return &.{};
+    if (tasks_val != .array) return &.{};
+
+    var out: std.ArrayListUnmanaged(ChecklistTaskInfo) = .empty;
+    errdefer out.deinit(allocator);
+    for (tasks_val.array.items) |task_val| {
+        if (task_val != .object) continue;
+        const id = integerField(task_val, "id") orelse continue;
+        const task_text = stringField(task_val, "text") orelse continue;
+        const completion_date = integerField(task_val, "completion_date") orelse 0;
+        try out.append(allocator, .{
+            .id = id,
+            .text = task_text,
+            .completed = completion_date != 0,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Returns the `checklist_tasks_done` object of `message` when present —
+/// the service message Telegram sends when a task's completion state
+/// changes on an existing checklist message.
+pub fn checklistTasksDone(message: std.json.Value) ?std.json.Value {
+    const value = objectField(message, "checklist_tasks_done") orelse return null;
+    return if (value == .object) value else null;
+}
+
+/// The embedded checklist message inside a ChecklistTasksDone service
+/// message, when present. Carries the checklist's complete, current state —
+/// no lookup by message id is needed.
+pub fn checklistTasksDoneMessage(ctd: std.json.Value) ?std.json.Value {
+    const value = objectField(ctd, "checklist_message") orelse return null;
+    return if (value == .object) value else null;
+}
+
+fn integerArrayField(allocator: std.mem.Allocator, value: std.json.Value, key: []const u8) ![]i64 {
+    const arr_val = objectField(value, key) orelse return &.{};
+    if (arr_val != .array) return &.{};
+
+    var out: std.ArrayListUnmanaged(i64) = .empty;
+    errdefer out.deinit(allocator);
+    for (arr_val.array.items) |item| {
+        if (item == .integer) try out.append(allocator, item.integer);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Task ids marked done in a ChecklistTasksDone update (caller-owned,
+/// free with `allocator.free`).
+pub fn checklistTasksDoneMarkedDone(allocator: std.mem.Allocator, ctd: std.json.Value) ![]i64 {
+    return integerArrayField(allocator, ctd, "marked_as_done_task_ids");
+}
+
+/// Task ids marked not-done in a ChecklistTasksDone update (caller-owned,
+/// free with `allocator.free`).
+pub fn checklistTasksDoneMarkedNotDone(allocator: std.mem.Allocator, ctd: std.json.Value) ![]i64 {
+    return integerArrayField(allocator, ctd, "marked_as_not_done_task_ids");
+}
+
+/// Synthesizes a `- [ ]`/`- [x]` markdown checklist matching the outbound
+/// convention (blank line between title and list, per the
+/// telegram-rich-formatting skill's confirmed rendering rule). Caller owns
+/// the returned slice.
+pub fn synthesizeChecklistMarkdown(
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    tasks: []const ChecklistTaskInfo,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, title);
+    if (tasks.len > 0) {
+        try buf.appendSlice(allocator, "\n\n");
+        for (tasks, 0..) |t, i| {
+            if (i > 0) try buf.append(allocator, '\n');
+            try buf.appendSlice(allocator, if (t.completed) "- [x] " else "- [ ] ");
+            try buf.appendSlice(allocator, t.text);
+        }
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 pub fn text(message: std.json.Value) ?[]const u8 {
@@ -339,6 +445,126 @@ test "telegram update ingress falls back from text to caption" {
     const content = textOrCaption(allocator, parsed.value) orelse return error.TestExpectedEqual;
     defer allocator.free(content);
     try std.testing.expectEqualStrings("caption-only fallback", content);
+}
+
+test "checklist extracts title and tasks with mixed completion state" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"checklist":{"title":"Дожим","tasks":[
+        \\  {"id":1,"text":"Задача A","completion_date":0},
+        \\  {"id":2,"text":"Задача B","completion_date":1785700000}
+        \\]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const cl = checklist(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Дожим", checklistTitle(cl).?);
+
+    const tasks = try checklistTasks(allocator, cl);
+    defer allocator.free(tasks);
+    try std.testing.expectEqual(@as(usize, 2), tasks.len);
+    try std.testing.expectEqual(@as(i64, 1), tasks[0].id);
+    try std.testing.expectEqualStrings("Задача A", tasks[0].text);
+    try std.testing.expect(!tasks[0].completed);
+    try std.testing.expectEqual(@as(i64, 2), tasks[1].id);
+    try std.testing.expectEqualStrings("Задача B", tasks[1].text);
+    try std.testing.expect(tasks[1].completed);
+}
+
+test "checklist with empty tasks array yields title only" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"checklist":{"title":"Пустой список","tasks":[]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const cl = checklist(parsed.value) orelse return error.TestExpectedEqual;
+    const tasks = try checklistTasks(allocator, cl);
+    defer allocator.free(tasks);
+    try std.testing.expectEqual(@as(usize, 0), tasks.len);
+
+    const md = try synthesizeChecklistMarkdown(allocator, checklistTitle(cl).?, tasks);
+    defer allocator.free(md);
+    try std.testing.expectEqualStrings("Пустой список", md);
+}
+
+test "synthesizeChecklistMarkdown renders blank line then checkbox items" {
+    const allocator = std.testing.allocator;
+    const tasks = [_]ChecklistTaskInfo{
+        .{ .id = 1, .text = "Первая", .completed = false },
+        .{ .id = 2, .text = "Вторая", .completed = true },
+    };
+    const md = try synthesizeChecklistMarkdown(allocator, "Заголовок", &tasks);
+    defer allocator.free(md);
+    try std.testing.expectEqualStrings(
+        "Заголовок\n\n- [ ] Первая\n- [x] Вторая",
+        md,
+    );
+}
+
+test "checklistTasksDone extracts checklist_message and marked task ids" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"checklist_tasks_done":{
+        \\  "checklist_message":{"checklist":{"title":"Дожим","tasks":[
+        \\    {"id":1,"text":"Задача A","completion_date":1785700000},
+        \\    {"id":2,"text":"Задача B","completion_date":0}
+        \\  ]}},
+        \\  "marked_as_done_task_ids":[1],
+        \\  "marked_as_not_done_task_ids":[]
+        \\}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ctd = checklistTasksDone(parsed.value) orelse return error.TestExpectedEqual;
+    const done_ids = try checklistTasksDoneMarkedDone(allocator, ctd);
+    defer allocator.free(done_ids);
+    try std.testing.expectEqual(@as(usize, 1), done_ids.len);
+    try std.testing.expectEqual(@as(i64, 1), done_ids[0]);
+
+    const not_done_ids = try checklistTasksDoneMarkedNotDone(allocator, ctd);
+    defer allocator.free(not_done_ids);
+    try std.testing.expectEqual(@as(usize, 0), not_done_ids.len);
+
+    const cl_message = checklistTasksDoneMessage(ctd) orelse return error.TestExpectedEqual;
+    const cl = checklist(cl_message) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Дожим", checklistTitle(cl).?);
+    const tasks = try checklistTasks(allocator, cl);
+    defer allocator.free(tasks);
+    try std.testing.expectEqual(@as(usize, 2), tasks.len);
+    try std.testing.expect(tasks[0].completed);
+    try std.testing.expect(!tasks[1].completed);
+}
+
+test "checklistTasksDoneMessage returns null when checklist_message is absent" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"checklist_tasks_done":{"marked_as_done_task_ids":[5]}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ctd = checklistTasksDone(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expect(checklistTasksDoneMessage(ctd) == null);
+    const done_ids = try checklistTasksDoneMarkedDone(allocator, ctd);
+    defer allocator.free(done_ids);
+    try std.testing.expectEqual(@as(usize, 1), done_ids.len);
+    try std.testing.expectEqual(@as(i64, 5), done_ids[0]);
 }
 
 test "replyToText returns text of replied-to message (regression #916)" {
