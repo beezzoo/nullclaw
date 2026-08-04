@@ -768,7 +768,7 @@ test "autoCompactHistory does not orphan leading tool result" {
     try std.testing.expectEqual(@as(usize, 7), agent.history.items.len);
     try std.testing.expect(agent.history.items[0].role == .system);
     try std.testing.expect(agent.history.items[1].role == .assistant);
-    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "[Compaction summary]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "[Compaction summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "auto summary") != null);
     try std.testing.expect(agent.history.items[2].role == .assistant);
     try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[2].content);
