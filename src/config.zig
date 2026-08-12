@@ -411,6 +411,14 @@ pub const Config = struct {
         return false;
     }
 
+    /// Look up whether streaming is force-disabled for this provider via config.
+    pub fn getProviderDisableStreaming(self: *const Config, name: []const u8) bool {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.disable_streaming;
+        }
+        return false;
+    }
+
     /// Look up the optional streaming prompt byte limit for a provider.
     /// Returns null if provider is not in the list or has no limit set (no limit = always stream).
     pub fn getProviderMaxStreamingPromptBytes(self: *const Config, name: []const u8) ?usize {
@@ -1062,6 +1070,13 @@ pub const Config = struct {
                     if (entry.chat_template_enable_thinking_param) {
                         if (has_field) try w.print(", ", .{});
                         try w.print("\"chat_template_enable_thinking_param\": true", .{});
+                        has_field = true;
+                    }
+                }
+                if (comptime @hasField(ProviderEntry, "disable_streaming")) {
+                    if (entry.disable_streaming) {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"disable_streaming\": true", .{});
                         has_field = true;
                     }
                 }

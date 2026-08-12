@@ -1081,7 +1081,18 @@ pub const OpenAiCompatibleProvider = struct {
                 const has_tools = tool_calls_list.items.len > 0;
                 const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
                 if (!has_content and !has_tools and !has_reasoning) {
-                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning; treating as NoResponseContent", .{});
+                    const finish_reason: []const u8 = if (choices.array.items[0].object.get("finish_reason")) |fr|
+                        (if (fr == .string) fr.string else "unknown")
+                    else
+                        "unknown";
+                    const completion_tokens: i64 = if (root_obj.get("usage")) |usage_obj|
+                        (if (usage_obj == .object)
+                            (if (usage_obj.object.get("completion_tokens")) |v| (if (v == .integer) v.integer else 0) else 0)
+                        else
+                            0)
+                    else
+                        0;
+                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning; treating as NoResponseContent (finish_reason={s}, completion_tokens={d})", .{ finish_reason, completion_tokens });
                     return error.NoResponseContent;
                 }
 

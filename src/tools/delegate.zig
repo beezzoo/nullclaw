@@ -22,6 +22,7 @@ const TestCompleteFn = *const fn (
     chat_template_enable_thinking_param: bool,
     max_streaming_prompt_bytes: ?usize,
     extra_body_params: ?[]const u8,
+    disable_streaming: bool,
     model: []const u8,
     system_prompt: []const u8,
     prompt: []const u8,
@@ -127,6 +128,7 @@ pub const DelegateTool = struct {
                 if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
                 if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null,
                 if (provider_entry) |entry| entry.extra_body_params else null,
+                if (provider_entry) |entry| entry.disable_streaming else false,
                 ac.model,
                 sys_prompt,
                 full_prompt,
@@ -173,6 +175,7 @@ pub const DelegateTool = struct {
             cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
             cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
             cfg.getProviderExtraBodyParams(cfg.default_provider),
+            cfg.getProviderDisableStreaming(cfg.default_provider),
             default_model,
             fallback_system_prompt,
             full_prompt,
@@ -214,6 +217,7 @@ pub const DelegateTool = struct {
         chat_template_enable_thinking_param: bool,
         max_streaming_prompt_bytes: ?usize,
         extra_body_params: ?[]const u8,
+        disable_streaming: bool,
         model: []const u8,
         system_prompt: []const u8,
         prompt: []const u8,
@@ -232,6 +236,7 @@ pub const DelegateTool = struct {
                     chat_template_enable_thinking_param,
                     max_streaming_prompt_bytes,
                     extra_body_params,
+                    disable_streaming,
                     model,
                     system_prompt,
                     prompt,
@@ -250,6 +255,7 @@ pub const DelegateTool = struct {
             max_streaming_prompt_bytes,
             chat_template_enable_thinking_param,
             extra_body_params,
+            disable_streaming,
         );
         defer provider_holder.deinit();
         return provider_holder.provider().chatWithSystem(
@@ -272,6 +278,7 @@ var test_expected_api_mode: ?ProviderEntry.ApiMode = null;
 var test_expected_chat_template_enable_thinking_param: ?bool = null;
 var test_expected_max_streaming_prompt_bytes: ?usize = null;
 var test_expected_extra_body_params: ?[]const u8 = null;
+var test_expected_disable_streaming: ?bool = null;
 var test_expected_model_name: ?[]const u8 = null;
 var test_expected_system_prompt: ?[]const u8 = null;
 var test_expected_prompt: ?[]const u8 = null;
@@ -287,6 +294,7 @@ fn testCompleteAgentPrompt(
     chat_template_enable_thinking_param: bool,
     max_streaming_prompt_bytes: ?usize,
     extra_body_params: ?[]const u8,
+    disable_streaming: bool,
     model: []const u8,
     system_prompt: []const u8,
     prompt: []const u8,
@@ -323,6 +331,9 @@ fn testCompleteAgentPrompt(
     if (test_expected_extra_body_params) |expected| {
         try std.testing.expect(extra_body_params != null);
         try std.testing.expectEqualStrings(expected, extra_body_params.?);
+    }
+    if (test_expected_disable_streaming) |expected| {
+        try std.testing.expectEqual(expected, disable_streaming);
     }
     if (test_expected_model_name) |expected| {
         try std.testing.expectEqualStrings(expected, model);

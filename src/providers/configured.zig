@@ -23,6 +23,7 @@ pub fn holderFromConfig(
         cfg.getProviderMaxStreamingPromptBytes(provider_name),
         cfg.getProviderChatTemplateEnableThinkingParam(provider_name),
         cfg.getProviderExtraBodyParams(provider_name),
+        cfg.getProviderDisableStreaming(provider_name),
     );
 }
 
@@ -43,6 +44,7 @@ pub fn holderFromEntry(
         if (entry) |e| e.max_streaming_prompt_bytes else null,
         if (entry) |e| e.chat_template_enable_thinking_param else false,
         if (entry) |e| e.extra_body_params else null,
+        if (entry) |e| e.disable_streaming else false,
     );
 }
 
@@ -57,6 +59,7 @@ test "holderFromConfig applies provider runtime settings" {
         .chat_template_enable_thinking_param = true,
         .max_streaming_prompt_bytes = 123,
         .extra_body_params = "{\"seed\":1}",
+        .disable_streaming = true,
     }};
     const cfg = Config{
         .workspace_dir = "/tmp/nullclaw-test",
@@ -77,6 +80,7 @@ test "holderFromConfig applies provider runtime settings" {
             try std.testing.expect(provider.chat_template_enable_thinking_param);
             try std.testing.expectEqual(@as(?usize, 123), provider.max_streaming_prompt_bytes);
             try std.testing.expectEqualStrings("{\"seed\":1}", provider.extra_body_params.?);
+            try std.testing.expect(provider.disable_streaming);
         },
         else => return error.TestUnexpectedResult,
     }

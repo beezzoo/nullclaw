@@ -18,6 +18,7 @@ const HolderPlan = struct {
     chat_template_enable_thinking_param: bool,
     max_streaming_prompt_bytes: ?usize,
     extra_body_params: ?[]const u8,
+    disable_streaming: bool,
 };
 
 fn trimOptionalKey(raw_key: ?[]const u8) ?[]const u8 {
@@ -71,6 +72,7 @@ fn appendHolderPlan(
         .chat_template_enable_thinking_param = cfg.getProviderChatTemplateEnableThinkingParam(provider_name),
         .max_streaming_prompt_bytes = cfg.getProviderMaxStreamingPromptBytes(provider_name),
         .extra_body_params = cfg.getProviderExtraBodyParams(provider_name),
+        .disable_streaming = cfg.getProviderDisableStreaming(provider_name),
     });
     return plans.items.len;
 }
@@ -225,6 +227,7 @@ pub const RuntimeProviderBundle = struct {
                         plan.max_streaming_prompt_bytes,
                         plan.chat_template_enable_thinking_param,
                         plan.extra_body_params,
+                        plan.disable_streaming,
                     );
                     bundle.router_holders_initialized = i + 1;
                 }

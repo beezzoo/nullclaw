@@ -2804,6 +2804,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("chat_template_enable_thinking_param")) |ctp| {
                             if (ctp == .bool) pe.chat_template_enable_thinking_param = ctp.bool;
                         }
+                        if (val.object.get("disable_streaming")) |ds| {
+                            if (ds == .bool) pe.disable_streaming = ds.bool;
+                        }
                         if (val.object.get("max_streaming_prompt_bytes")) |mb| {
                             if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }
