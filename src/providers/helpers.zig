@@ -550,6 +550,20 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     else
         null;
 
+    return curlPostTimedRouted(allocator, url, body, headers, max_time, resolve_entry);
+}
+
+/// Routing decision extracted from `curlPostTimed` so it's testable with a
+/// synthetic `resolve_entry`, independent of `buildSafeResolveEntryForRemoteUrl`'s
+/// real DNS resolution.
+fn curlPostTimedRouted(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) ![]u8 {
     // A pinned resolve entry lets curl keep credential headers in a mode-0600
     // temporary file instead of argv. Prefer that path because std.http proxy
     // support is not available on every target libc/architecture combination.
@@ -562,7 +576,14 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
             null,
             max_time,
             entry,
-        );
+        ) catch |err| switch (err) {
+            // curl itself isn't runnable on this host — fall back to the
+            // in-process transport rather than failing the request. Any
+            // other error (HTTP status, TLS/connect/timeout failures curl
+            // itself reports) must propagate unchanged.
+            error.FileNotFound => return http_util.httpPostJsonWithProxy(allocator, url, body, headers, null),
+            else => return err,
+        };
     }
 
     // Provider requests often carry Authorization/x-api-key credentials.
@@ -901,4 +922,140 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+// ── curlPostTimedRouted transport-fallback tests ────────────────────────────
+
+const RoutedServerCtx = struct {
+    server: *std_compat.net.Server,
+    response: []const u8,
+    saw_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn serveRoutedTestResponse(ctx: *RoutedServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    var buf: [2048]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return;
+        if (n == 0) break;
+        filled += n;
+        if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+    }
+    ctx.saw_request.store(true, .release);
+    conn.stream.writeAll(ctx.response) catch {};
+}
+
+fn unblockRoutedTestServer(server: *std_compat.net.Server) void {
+    var conn = std_compat.net.tcpConnectToAddress(server.listen_address) catch return;
+    conn.close();
+}
+
+test "curlPostTimedRouted falls back to std.http when curl cannot be launched" {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = RoutedServerCtx{
+        .server = &server,
+        .response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    };
+    var thread = try std.Thread.spawn(.{}, serveRoutedTestResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/x", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    // Point PATH at an empty temp directory so any subprocess spawn of a
+    // bare "curl" fails with error.FileNotFound, then restore it after.
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const platform = @import("../platform.zig");
+
+    const key_z = try allocator.dupeZ(u8, "PATH");
+    defer allocator.free(key_z);
+    const old_path = platform.getEnvOrNull(allocator, "PATH");
+    defer if (old_path) |p| allocator.free(p);
+    const old_path_z = if (old_path) |p| try allocator.dupeZ(u8, p) else null;
+    defer if (old_path_z) |p| allocator.free(p);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const empty_dir_abs = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(empty_dir_abs);
+    const empty_dir_z = try allocator.dupeZ(u8, empty_dir_abs);
+    defer allocator.free(empty_dir_z);
+
+    _ = c.setenv(key_z.ptr, empty_dir_z.ptr, 1);
+    defer {
+        if (old_path_z) |p| {
+            _ = c.setenv(key_z.ptr, p.ptr, 1);
+        } else {
+            _ = c.unsetenv(key_z.ptr);
+        }
+    }
+
+    const body = try curlPostTimedRouted(allocator, url, "{}", &.{}, null, "placeholder:1:0.0.0.0");
+    defer allocator.free(body);
+
+    if (!ctx.saw_request.load(.acquire)) unblockRoutedTestServer(&server);
+    thread.join();
+
+    // Regression: a curl-unspawnable host must not surface error.FileNotFound
+    // to the caller — it must retry via the in-process transport and return
+    // that transport's real response.
+    try std.testing.expectEqualStrings("{\"ok\":true}", body);
+}
+
+test "curlPostTimedRouted does not fall back when curl succeeds with a non-2xx response" {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = RoutedServerCtx{
+        .server = &server,
+        .response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbroken\n",
+    };
+    var thread = try std.Thread.spawn(.{}, serveRoutedTestResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/x", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    // curl is left available: a non-2xx response is a *successful* curl
+    // invocation (curl only fails on transport errors, not HTTP status), so
+    // the FileNotFound fallback must never engage here.
+    const body = try curlPostTimedRouted(allocator, url, "{}", &.{}, null, "placeholder:1:0.0.0.0");
+    defer allocator.free(body);
+
+    if (!ctx.saw_request.load(.acquire)) unblockRoutedTestServer(&server);
+    thread.join();
+
+    try std.testing.expectEqualStrings("broken\n", body);
+}
+
+test "curlPostTimedRouted propagates a curl transport error without falling back" {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    const port = server.listen_address.in.getPort();
+    server.deinit(); // nothing listens on this port from here on
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/x", .{port});
+    defer allocator.free(url);
+
+    // curl is available and actually runs, but the connection itself fails.
+    // That must surface as the curl-specific transport error, not trigger
+    // the FileNotFound fallback and not silently succeed.
+    const result = curlPostTimedRouted(allocator, url, "{}", &.{}, "5", "placeholder:1:0.0.0.0");
+    try std.testing.expectError(error.CurlConnectError, result);
 }
