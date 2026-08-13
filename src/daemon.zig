@@ -3344,7 +3344,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
         .peer_kind = .group,
         .peer_id = "-100123",
         .thread_id = "77",
-    });
+    }, null);
     runtime_job.session_target = .main;
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);

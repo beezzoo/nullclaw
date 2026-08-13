@@ -3233,6 +3233,12 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const prompt_opt = cronObjectStringField(obj, "prompt");
     const command_opt = cronObjectStringField(obj, "command");
     const model_opt = cronObjectStringField(obj, "model");
+    const agent_id_opt = cronObjectStringField(obj, "agent_id");
+    if (agent_id_opt != null and prompt_opt == null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"agent_id applies only to agent jobs (requires prompt)\"}";
+        return;
+    }
     const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
         cron_mod.SessionTarget.parseStrict(raw) catch {
             ctx.response_status = "400 Bad Request";
@@ -3293,7 +3299,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
 
     const job_ptr = if (delay_opt) |delay|
         if (prompt_opt != null)
-            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery) catch |err| {
+            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery, agent_id_opt) catch |err| {
                 ctx.response_status = "400 Bad Request";
                 ctx.response_body = if (err == error.MaxTasksReached)
                     "{\"error\":\"max tasks reached\"}"
@@ -3321,7 +3327,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             };
         }
     else if (prompt_opt != null)
-        sched.addAgentJob(expression_opt.?, prompt_opt.?, model_opt, delivery) catch |err| {
+        sched.addAgentJob(expression_opt.?, prompt_opt.?, model_opt, delivery, agent_id_opt) catch |err| {
             ctx.response_status = "400 Bad Request";
             ctx.response_body = if (err == error.MaxTasksReached)
                 "{\"error\":\"max tasks reached\"}"
@@ -3530,6 +3536,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const command = cronObjectStringField(obj, "command");
     const prompt = cronObjectStringField(obj, "prompt");
     const model = cronObjectStringField(obj, "model");
+    const agent_id = cronObjectStringField(obj, "agent_id");
     const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
         cron_mod.SessionTarget.parseStrict(raw) catch {
             ctx.response_status = "400 Bad Request";
@@ -3563,16 +3570,35 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         }
     }
 
+    if (agent_id != null) {
+        const existing = sched.getJob(id) orelse {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"job not found\"}";
+            return;
+        };
+        if (existing.job_type != .agent) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"agent_id applies only to agent jobs\"}";
+            return;
+        }
+    }
+
     const patch = cron_mod.CronJobPatch{
         .expression = expression,
         .command = command,
         .prompt = prompt,
         .model = model,
+        .agent_id = agent_id,
         .session_target = session_target,
         .enabled = enabled_opt,
     };
 
-    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+    // updateJob dupes patch string fields with the given allocator and stores
+    // the result on the long-lived CronJob. Use sched.allocator (not
+    // ctx.req_allocator, a per-request arena that is torn down right after
+    // this handler returns) so the duped values don't become dangling
+    // pointers the moment the request completes.
+    if (!sched.updateJob(sched.allocator, id, patch)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found or update failed\"}";
         return;
@@ -6816,7 +6842,7 @@ test "handleCronAdd rejects invalid session_target" {
 test "handleCronUpdate accepts session_target" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{}, null);
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
 
@@ -6888,7 +6914,7 @@ test "handleCronUpdate rejects session_target for shell jobs" {
 test "handleCronUpdate rejects invalid session_target" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{}, null);
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
 
@@ -6919,6 +6945,154 @@ test "handleCronUpdate rejects invalid session_target" {
 
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
+
+test "handleCronAdd sets agent_id for agent jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"0 7 * * *\",\"prompt\":\"Утренняя сводка\",\"agent_id\":\"taskmaster\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].agent_id != null);
+    try std.testing.expectEqualStrings("taskmaster", jobs[0].agent_id.?);
+}
+
+test "handleCronAdd rejects agent_id for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo hello\",\"agent_id\":\"taskmaster\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "agent_id applies only to agent jobs") != null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "handleCronUpdate accepts agent_id for agent jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{}, null);
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"agent_id\":\"wiki\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expect(scheduler.listJobs()[0].agent_id != null);
+    try std.testing.expectEqualStrings("wiki", scheduler.listJobs()[0].agent_id.?);
+}
+
+test "handleCronUpdate rejects agent_id for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("* * * * *", "echo hello");
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"agent_id\":\"taskmaster\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "agent_id applies only to agent jobs") != null);
+    try std.testing.expect(scheduler.listJobs()[0].agent_id == null);
 }
 
 test "constants are set correctly" {

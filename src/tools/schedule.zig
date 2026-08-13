@@ -8,6 +8,18 @@ const CronScheduler = cron.CronScheduler;
 const agent_routing = @import("../agent_routing.zig");
 const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
+const config_mod = @import("../config.zig");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
+
+fn agentIsConfigured(allocator: std.mem.Allocator, agent_id: []const u8) bool {
+    var cfg = config_mod.Config.load(allocator) catch return false;
+    defer cfg.deinit();
+    for (cfg.agents) |agent_cfg| {
+        if (std.mem.eql(u8, agent_cfg.name, agent_id)) return true;
+    }
+    return false;
+}
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
 threadlocal var tls_schedule_account_id: ?[]const u8 = null;
@@ -22,7 +34,7 @@ pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
     pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Use 'command' for shell jobs or 'prompt' (with optional 'model') for agent jobs. Optional delivery params: channel, account_id, chat_id. Set session_target to 'main' for agent jobs to route results through the main agent.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"prompt":{"type":"string","description":"Agent prompt for an agent job"},"model":{"type":"string","description":"Optional model override for agent jobs"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent jobs: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"prompt":{"type":"string","description":"Agent prompt for an agent job"},"model":{"type":"string","description":"Optional model override for agent jobs"},"agent_id":{"type":"string","description":"Agent ID to run (e.g. 'taskmaster'). Only for agent jobs (when 'prompt' is set)."},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent jobs: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -182,6 +194,7 @@ pub const ScheduleTool = struct {
             const command = root.getString(args, "command");
             const prompt = root.getString(args, "prompt");
             const model = root.getString(args, "model");
+            const agent_id = root.getString(args, "agent_id");
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
             if (command == null and prompt == null)
@@ -190,6 +203,14 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Provide either 'command' or 'prompt', not both");
             if (prompt == null and session_target != .isolated)
                 return ToolResult.fail("session_target is only supported for agent jobs created with 'prompt'");
+            if (agent_id != null and prompt == null)
+                return ToolResult.fail("'agent_id' is only supported for agent jobs created with 'prompt'");
+            if (agent_id) |aid| {
+                if (!agentIsConfigured(allocator, aid)) {
+                    const msg = try std.fmt.allocPrint(allocator, "Unknown agent_id '{s}': not found in configured agents", .{aid});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            }
 
             const context_routing_allowed = explicit_channel == null and explicit_account_id == null and explicit_chat_id == null;
             const gateway_delivery = if (chat_id) |cid|
@@ -214,6 +235,7 @@ pub const ScheduleTool = struct {
                 model,
                 gateway_delivery,
                 if (prompt != null) session_target else null,
+                agent_id,
             ) catch null;
             if (gateway_body) |json_body| {
                 defer allocator.free(json_body);
@@ -234,7 +256,7 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             const job = if (prompt) |job_prompt|
-                scheduler.addAgentJob(expression, job_prompt, model, gateway_delivery orelse .{}) catch |err| {
+                scheduler.addAgentJob(expression, job_prompt, model, gateway_delivery orelse .{}, agent_id) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }
@@ -299,6 +321,7 @@ pub const ScheduleTool = struct {
             const command = root.getString(args, "command");
             const prompt = root.getString(args, "prompt");
             const model = root.getString(args, "model");
+            const agent_id = root.getString(args, "agent_id");
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
             if (command == null and prompt == null)
@@ -307,6 +330,14 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Provide either 'command' or 'prompt', not both");
             if (prompt == null and session_target != .isolated)
                 return ToolResult.fail("session_target is only supported for agent jobs created with 'prompt'");
+            if (agent_id != null and prompt == null)
+                return ToolResult.fail("'agent_id' is only supported for agent jobs created with 'prompt'");
+            if (agent_id) |aid| {
+                if (!agentIsConfigured(allocator, aid)) {
+                    const msg = try std.fmt.allocPrint(allocator, "Unknown agent_id '{s}': not found in configured agents", .{aid});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            }
 
             const context_routing_allowed = explicit_channel == null and explicit_account_id == null and explicit_chat_id == null;
             const gateway_delivery = if (chat_id) |cid|
@@ -331,6 +362,7 @@ pub const ScheduleTool = struct {
                 model,
                 gateway_delivery,
                 if (prompt != null) session_target else null,
+                agent_id,
             ) catch null;
             if (gateway_body) |json_body| {
                 defer allocator.free(json_body);
@@ -351,7 +383,7 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             const job = if (prompt) |job_prompt|
-                scheduler.addAgentOnce(delay, job_prompt, model, gateway_delivery orelse .{}) catch |err| {
+                scheduler.addAgentOnce(delay, job_prompt, model, gateway_delivery orelse .{}, agent_id) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot agent task: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }
@@ -546,6 +578,140 @@ test "schedule create supports agent jobs with session_target" {
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created agent job") != null);
     }
+}
+
+test "schedule create rejects agent_id on shell jobs" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"command\": \"echo hi\", \"agent_id\": \"taskmaster\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "agent_id") != null);
+}
+
+test "schedule create rejects unknown agent_id and creates no job" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    try std_compat.fs.cwd().makePath(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    const config_path = try std_compat.fs.path.join(allocator, &.{ test_home, "config.json" });
+    defer allocator.free(config_path);
+    {
+        const file = try std_compat.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll(
+            \\{"agents":{"list":[{"name":"taskmaster","provider":"anthropic","model":"claude-haiku-3.5"}]}}
+        );
+    }
+
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"prompt\": \"Summarize\", \"agent_id\": \"nonexistent\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.error_msg) |e| allocator.free(e);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown agent_id") != null);
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    cron.loadJobsStrict(&loaded) catch {};
+    try std.testing.expectEqual(@as(usize, 0), loaded.listJobs().len);
+}
+
+test "schedule create accepts a configured agent_id" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    try std_compat.fs.cwd().makePath(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    const config_path = try std_compat.fs.path.join(allocator, &.{ test_home, "config.json" });
+    defer allocator.free(config_path);
+    {
+        const file = try std_compat.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll(
+            \\{"agents":{"list":[{"name":"taskmaster","provider":"anthropic","model":"claude-haiku-3.5"}]}}
+        );
+    }
+
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"prompt\": \"Summarize\", \"agent_id\": \"taskmaster\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    try std.testing.expect(loaded.listJobs()[0].agent_id != null);
+    try std.testing.expectEqualStrings("taskmaster", loaded.listJobs()[0].agent_id.?);
 }
 
 test "schedule create rejects cross-channel override without explicit chat_id" {

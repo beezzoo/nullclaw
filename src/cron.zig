@@ -174,6 +174,7 @@ pub const CronJobPatch = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
     model: ?[]const u8 = null,
+    agent_id: ?[]const u8 = null,
     delete_after_run: ?bool = null,
     session_target: ?SessionTarget = null,
 };
@@ -193,6 +194,7 @@ pub const CronJob = struct {
     prompt: ?[]const u8 = null,
     name: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    agent_id: ?[]const u8 = null,
     enabled: bool = true,
     delete_after_run: bool = false,
     created_at_s: i64 = 0,
@@ -527,6 +529,7 @@ pub const CronScheduler = struct {
         if (job.prompt) |prompt| self.allocator.free(prompt);
         if (job.name) |name| self.allocator.free(name);
         if (job.model) |model| self.allocator.free(model);
+        if (job.agent_id) |agent_id| self.allocator.free(agent_id);
         if (job.last_output) |output| self.allocator.free(output);
         if (job.delivery.channel_owned) {
             if (job.delivery.channel) |channel| self.allocator.free(channel);
@@ -624,7 +627,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a recurring agent job.
-    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
+    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, agent_id: ?[]const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
@@ -642,6 +645,7 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .agent_id = if (agent_id) |a| try self.allocator.dupe(u8, a) else null,
             .delivery = .{
                 .mode = delivery.mode,
                 .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
@@ -663,7 +667,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a one-shot delayed agent task.
-    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
+    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, agent_id: ?[]const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
@@ -684,6 +688,7 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .agent_id = if (agent_id) |a| try self.allocator.dupe(u8, a) else null,
             .delivery = .{
                 .mode = delivery.mode,
                 .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
@@ -766,6 +771,11 @@ pub const CronScheduler = struct {
             const new_model = allocator.dupe(u8, model) catch return false;
             if (job.model) |old_model| allocator.free(old_model);
             job.model = new_model;
+        }
+        if (patch.agent_id) |agent_id| {
+            const new_agent_id = allocator.dupe(u8, agent_id) catch return false;
+            if (job.agent_id) |old_agent_id| allocator.free(old_agent_id);
+            job.agent_id = new_agent_id;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -981,7 +991,7 @@ pub const CronScheduler = struct {
                             }
                         }
                     } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, job.delivery) catch |err| {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, job.agent_id, self.agent_timeout_secs, job.delivery) catch |err| {
                             log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
                             job.last_run_secs = now;
                             job.last_status = "error";
@@ -1085,16 +1095,18 @@ fn runAgentJob(
     cwd: ?[]const u8,
     prompt: []const u8,
     model: ?[]const u8,
+    agent_id: ?[]const u8,
     timeout_secs: u64,
     delivery: DeliveryConfig,
 ) !AgentRunResult {
-    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery));
+    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery, agent_id));
 }
 
-fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOptions {
+fn agentRunOptionsForDelivery(delivery: DeliveryConfig, agent_id: ?[]const u8) agent_runner.AgentRunOptions {
     return .{
         .origin_channel = delivery.channel,
         .origin_account_id = delivery.account_id,
+        .agent_id = agent_id,
     };
 }
 
@@ -1236,6 +1248,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const agent_id = blk: {
+            if (obj.get("agent_id")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
         const enabled = blk: {
             if (obj.get("enabled")) |v| {
                 if (v == .bool) break :blk v.bool;
@@ -1328,6 +1346,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .session_target = session_target,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .agent_id = if (agent_id) |a| try scheduler.allocator.dupe(u8, a) else null,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
             .delivery = .{
@@ -1630,6 +1649,9 @@ fn appendCronJobJson(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "model");
     try appendNullableString(buf, allocator, job.model);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "agent_id");
+    try appendNullableString(buf, allocator, job.agent_id);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "enabled");
     try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
@@ -2136,6 +2158,7 @@ pub fn buildGatewayAddBody(
     model: ?[]const u8,
     delivery: ?DeliveryConfig,
     session_target: ?SessionTarget,
+    agent_id: ?[]const u8,
 ) ![]u8 {
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_buf.deinit(allocator);
@@ -2148,6 +2171,7 @@ pub fn buildGatewayAddBody(
     if (command) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "command", value);
     if (prompt) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "prompt", value);
     if (model) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "model", value);
+    if (agent_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "agent_id", value);
     if (session_target) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "session_target", value.asStr());
 
     if (delivery) |cfg| {
@@ -2194,7 +2218,7 @@ fn appendGatewayBodyLiteral(
 pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        const body = buildGatewayAddBody(allocator, expression, null, command, null, null, null, null) catch null;
+        const body = buildGatewayAddBody(allocator, expression, null, command, null, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
             if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
@@ -2222,6 +2246,7 @@ pub fn cliAddAgentJob(
     model: ?[]const u8,
     session_target: SessionTarget,
     delivery: DeliveryConfig,
+    agent_id: ?[]const u8,
 ) !void {
     const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
@@ -2235,6 +2260,7 @@ pub fn cliAddAgentJob(
             model,
             enriched_delivery,
             if (session_target == .isolated) null else session_target,
+            agent_id,
         ) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
@@ -2246,7 +2272,7 @@ pub fn cliAddAgentJob(
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentJob(expression, prompt, model, enriched_delivery);
+    const job = try scheduler.addAgentJob(expression, prompt, model, enriched_delivery, agent_id);
     job.session_target = session_target;
     try saveJobs(&scheduler);
 
@@ -2254,13 +2280,14 @@ pub fn cliAddAgentJob(
     log.info("  Expr : {s}", .{job.expression});
     log.info("  Type : {s}", .{job.job_type.asStr()});
     if (job.model) |m| log.info("  Model: {s}", .{m});
+    if (job.agent_id) |a| log.info("  Agent: {s}", .{a});
 }
 
 /// CLI: add a one-shot delayed task.
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        const body = buildGatewayAddBody(allocator, null, delay, command, null, null, null, null) catch null;
+        const body = buildGatewayAddBody(allocator, null, delay, command, null, null, null, null, null) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
             if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
@@ -2287,6 +2314,7 @@ pub fn cliAddAgentOnce(
     model: ?[]const u8,
     session_target: SessionTarget,
     delivery: DeliveryConfig,
+    agent_id: ?[]const u8,
 ) !void {
     const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
@@ -2300,6 +2328,7 @@ pub fn cliAddAgentOnce(
             model,
             enriched_delivery,
             if (session_target == .isolated) null else session_target,
+            agent_id,
         ) catch null;
         if (body) |json_body| {
             defer allocator.free(json_body);
@@ -2311,7 +2340,7 @@ pub fn cliAddAgentOnce(
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery);
+    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery, agent_id);
     job.session_target = session_target;
     try saveJobs(&scheduler);
 
@@ -2319,6 +2348,7 @@ pub fn cliAddAgentOnce(
     log.info("  Runs at: {d}", .{job.next_run_secs});
     log.info("  Type   : {s}", .{job.job_type.asStr()});
     if (job.model) |m| log.info("  Model  : {s}", .{m});
+    if (job.agent_id) |a| log.info("  Agent  : {s}", .{a});
 }
 
 /// CLI: remove a cron job by ID.
@@ -2474,7 +2504,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, job.delivery) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, job.agent_id, scheduler.agent_timeout_secs, job.delivery) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
@@ -3089,7 +3119,7 @@ test "save and load roundtrip keeps agent fields" {
         .peer_id = "-100123",
         .thread_id = "77",
         .best_effort = false,
-    });
+    }, null);
     recurring.session_target = .main;
     try saveJobs(&scheduler);
 
@@ -3118,6 +3148,28 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
     try std.testing.expect(!job.delivery.best_effort);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+}
+
+test "save and load roundtrip keeps agent_id" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addAgentJob("0 7 * * *", "Утренняя сводка", null, .{}, "taskmaster");
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expect(job.agent_id != null);
+    try std.testing.expectEqualStrings("taskmaster", job.agent_id.?);
 }
 
 test "cliAddAgentOnce persists delivery routing" {
@@ -3167,7 +3219,7 @@ test "cliAddAgentOnce persists delivery routing" {
         .account_id = "main",
         .to = "chat-42",
         .best_effort = false,
-    });
+    }, null);
 
     var loaded = CronScheduler.init(allocator, 10, true);
     defer loaded.deinit();
@@ -3301,7 +3353,7 @@ test "updateJob keeps agent command and prompt in sync" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a", .{});
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a", .{}, null);
     const id = scheduler.listJobs()[0].id;
 
     // Back-compat: updating command should update agent prompt.
@@ -3328,7 +3380,7 @@ test "CronScheduler remove frees agent job fields" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free", .{});
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free", .{}, null);
     try std.testing.expect(scheduler.removeJob(job.id));
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -3403,7 +3455,7 @@ test "tick removes more than 64 one-shot jobs in one pass" {
 
     var i: usize = 0;
     while (i < 80) : (i += 1) {
-        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
+        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{}, null);
     }
 
     const now = std_compat.time.timestamp();
@@ -3707,7 +3759,7 @@ test "agent job delivers result via bus" {
         .mode = .always,
         .channel = "discord",
         .to = "general",
-    });
+    }, null);
     job.next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
@@ -3735,7 +3787,7 @@ test "one-shot isolated agent delivery outlives removed job" {
         .channel = "telegram",
         .account_id = "main",
         .to = "chat-42",
-    });
+    }, null);
     job.next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
@@ -3763,7 +3815,7 @@ test "one-shot main agent delivery outlives removed job" {
         .channel = "telegram",
         .account_id = "main",
         .to = "chat-42",
-    });
+    }, null);
     job.session_target = .main;
     job.next_run_secs = 0;
 
@@ -3784,9 +3836,10 @@ test "agent run options preserve cron delivery attribution" {
     const options = agentRunOptionsForDelivery(.{
         .channel = "telegram",
         .account_id = "main",
-    });
+    }, "taskmaster");
     try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
     try std.testing.expectEqualStrings("main", options.origin_account_id.?);
+    try std.testing.expectEqualStrings("taskmaster", options.agent_id.?);
 }
 
 test "DeliveryMode parse and asStr" {
@@ -4086,7 +4139,7 @@ test "cron register + cancel leaks zero bytes for every job kind" {
         .peer_id = "user-99",
         .thread_id = "topic-7",
         .best_effort = false,
-    });
+    }, null);
     const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
     defer alloc.free(agent_recurring_id);
     try std.testing.expect(sched.removeJob(agent_recurring_id));
@@ -4103,7 +4156,7 @@ test "cron register + cancel leaks zero bytes for every job kind" {
         .peer_id = "guild-42",
         .thread_id = null,
         .best_effort = true,
-    });
+    }, null);
     const agent_once_id = try alloc.dupe(u8, agent_once.id);
     defer alloc.free(agent_once_id);
     try std.testing.expect(sched.removeJob(agent_once_id));

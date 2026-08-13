@@ -21,8 +21,9 @@ pub fn buildAddBody(
     model: ?[]const u8,
     delivery: ?cron.DeliveryConfig,
     session_target: ?cron.SessionTarget,
+    agent_id: ?[]const u8,
 ) ![]u8 {
-    return cron.buildGatewayAddBody(allocator, expression, delay, command, prompt, model, delivery, session_target);
+    return cron.buildGatewayAddBody(allocator, expression, delay, command, prompt, model, delivery, session_target, agent_id);
 }
 
 pub fn buildUpdateBody(
@@ -34,6 +35,7 @@ pub fn buildUpdateBody(
     model: ?[]const u8,
     enabled: ?bool,
     session_target: ?cron.SessionTarget,
+    agent_id: ?[]const u8,
 ) ![]u8 {
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_buf.deinit(allocator);
@@ -53,6 +55,9 @@ pub fn buildUpdateBody(
     }
     if (model) |value| {
         try appendBodyField(&body_buf, allocator, &wrote_field, "model", value);
+    }
+    if (agent_id) |value| {
+        try appendBodyField(&body_buf, allocator, &wrote_field, "agent_id", value);
     }
     if (enabled) |value| {
         try appendBodyLiteral(&body_buf, allocator, &wrote_field, if (value) "\"enabled\":true" else "\"enabled\":false");
@@ -124,6 +129,7 @@ test "buildAddBody includes delivery fields" {
             .best_effort = false,
         },
         .main,
+        null,
     );
     defer std.testing.allocator.free(body);
 
@@ -153,6 +159,7 @@ test "buildAddBody preserves explicit disabled delivery" {
         null,
         .{ .mode = .none, .channel = "telegram", .to = "chat-42" },
         null,
+        null,
     );
     defer std.testing.allocator.free(body);
 
@@ -164,7 +171,7 @@ test "buildAddBody preserves explicit disabled delivery" {
 }
 
 test "buildUpdateBody includes enabled flag" {
-    const body = try buildUpdateBody(std.testing.allocator, "job-9", "*/5 * * * *", "echo updated", null, null, false, .main);
+    const body = try buildUpdateBody(std.testing.allocator, "job-9", "*/5 * * * *", "echo updated", null, null, false, .main, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

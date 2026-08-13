@@ -17,6 +17,7 @@ pub const AgentRunResult = struct {
 pub const AgentRunOptions = struct {
     origin_channel: ?[]const u8 = null,
     origin_account_id: ?[]const u8 = null,
+    agent_id: ?[]const u8 = null,
 };
 
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -212,6 +213,10 @@ fn appendAgentArgv(
     if (options.origin_account_id) |account_id| {
         try argv.append(allocator, "--origin-account-id");
         try argv.append(allocator, account_id);
+    }
+    if (options.agent_id) |agent_id| {
+        try argv.append(allocator, "--agent");
+        try argv.append(allocator, agent_id);
     }
     try argv.append(allocator, "-m");
     try argv.append(allocator, prompt);
@@ -487,6 +492,37 @@ test "appendAgentArgv includes cron origin attribution" {
         "telegram",
         "--origin-account-id",
         "main",
+        "-m",
+        "Summarize status",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "appendAgentArgv includes --agent when agent_id is set" {
+    const allocator = std.testing.allocator;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "Summarize status", "test-model", .{
+        .origin_channel = "telegram",
+        .origin_account_id = "main",
+        .agent_id = "taskmaster",
+    });
+
+    const expected = [_][]const u8{
+        "/usr/bin/nullclaw",
+        "agent",
+        "--model",
+        "test-model",
+        "--origin-channel",
+        "telegram",
+        "--origin-account-id",
+        "main",
+        "--agent",
+        "taskmaster",
         "-m",
         "Summarize status",
     };

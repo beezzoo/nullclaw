@@ -13,7 +13,7 @@ pub const CronUpdateTool = struct {
     pub const tool_name = "cron_update";
     pub const tool_description = "Update a cron job: change expression, command, prompt, model, session_target, or enable/disable it.";
     pub const tool_params =
-        \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to update"},"expression":{"type":"string","description":"New cron expression"},"command":{"type":"string","description":"New command to execute"},"prompt":{"type":"string","description":"New prompt for agent jobs"},"model":{"type":"string","description":"New model override for agent jobs"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent job delivery"},"enabled":{"type":"boolean","description":"Enable or disable the job"}},"required":["job_id"]}
+        \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to update"},"expression":{"type":"string","description":"New cron expression"},"command":{"type":"string","description":"New command to execute"},"prompt":{"type":"string","description":"New prompt for agent jobs"},"model":{"type":"string","description":"New model override for agent jobs"},"agent_id":{"type":"string","description":"New agent ID for agent jobs (e.g. 'taskmaster')"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent job delivery"},"enabled":{"type":"boolean","description":"Enable or disable the job"}},"required":["job_id"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -33,6 +33,7 @@ pub const CronUpdateTool = struct {
         const command = root.getString(args, "command");
         const prompt = root.getString(args, "prompt");
         const model = root.getString(args, "model");
+        const agent_id = root.getString(args, "agent_id");
         const session_target = if (root.getString(args, "session_target")) |raw|
             cron.SessionTarget.parseStrict(raw) catch
                 return ToolResult.fail("Invalid 'session_target' parameter: expected 'isolated' or 'main'")
@@ -41,8 +42,8 @@ pub const CronUpdateTool = struct {
         const enabled = root.getBool(args, "enabled");
 
         // Validate that at least one field is being updated
-        if (expression == null and command == null and prompt == null and model == null and session_target == null and enabled == null)
-            return ToolResult.fail("Nothing to update — provide expression, command, prompt, model, session_target, or enabled");
+        if (expression == null and command == null and prompt == null and model == null and agent_id == null and session_target == null and enabled == null)
+            return ToolResult.fail("Nothing to update — provide expression, command, prompt, model, agent_id, session_target, or enabled");
 
         // Validate expression if provided
         if (expression) |expr| {
@@ -50,7 +51,7 @@ pub const CronUpdateTool = struct {
                 return ToolResult.fail("Invalid cron expression");
         }
 
-        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, prompt, model, enabled, session_target) catch null;
+        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, prompt, model, enabled, session_target, agent_id) catch null;
         if (gateway_body) |json_body| {
             defer allocator.free(json_body);
             switch (cron.requestGatewayPost(allocator, "/cron/update", json_body)) {
@@ -79,11 +80,22 @@ pub const CronUpdateTool = struct {
             }
         }
 
+        if (agent_id != null) {
+            const existing = scheduler.getJob(job_id) orelse {
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{job_id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            if (existing.job_type != .agent) {
+                return ToolResult.fail("agent_id applies only to agent jobs");
+            }
+        }
+
         const patch = cron.CronJobPatch{
             .expression = expression,
             .command = command,
             .prompt = prompt,
             .model = model,
+            .agent_id = agent_id,
             .session_target = session_target,
             .enabled = enabled,
         };
@@ -105,6 +117,7 @@ pub const CronUpdateTool = struct {
         if (command) |cmd| try w.print(" | command={s}", .{cmd});
         if (prompt) |value| try w.print(" | prompt={s}", .{value});
         if (model) |value| try w.print(" | model={s}", .{value});
+        if (agent_id) |value| try w.print(" | agent_id={s}", .{value});
         if (session_target) |value| try w.print(" | session_target={s}", .{value.asStr()});
         if (enabled) |ena| try w.print(" | enabled={s}", .{if (ena) "true" else "false"});
 
@@ -222,8 +235,45 @@ test "cron_update rejects invalid session_target" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "session_target") != null);
 }
 
+test "cron_update sets agent_id for agent jobs" {
+    var ct = CronUpdateTool{};
+    const t = ct.tool();
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("*/5 * * * *", "Summarize incidents", null, .{}, null);
+    cron.saveJobs(&scheduler) catch {};
+
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"agent_id\": \"taskmaster\"}}", .{job.id});
+    defer std.testing.allocator.free(args);
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    if (result.success) {
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "agent_id=taskmaster") != null);
+    }
+}
+
+test "cron_update rejects agent_id for shell jobs" {
+    var ct = CronUpdateTool{};
+    const t = ct.tool();
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("*/5 * * * *", "echo test");
+    cron.saveJobs(&scheduler) catch {};
+
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"agent_id\": \"taskmaster\"}}", .{job.id});
+    defer std.testing.allocator.free(args);
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "agent_id") != null);
+}
+
 test "cron_update gateway request body keeps enabled false" {
-    const body = try cron_gateway.buildUpdateBody(std.testing.allocator, "job-42", null, "echo hi", null, null, false, .main);
+    const body = try cron_gateway.buildUpdateBody(std.testing.allocator, "job-42", null, "echo hi", null, null, false, .main, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

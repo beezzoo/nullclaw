@@ -945,6 +945,7 @@ const CronAddAgentOptions = struct {
     model: ?[]const u8 = null,
     session_target: yc.cron.SessionTarget = .isolated,
     delivery: yc.cron.DeliveryConfig = .{},
+    agent_id: ?[]const u8 = null,
 };
 
 fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
@@ -979,6 +980,9 @@ fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !Cron
         } else if (std.mem.eql(u8, sub_args[i], "--to")) {
             options.delivery.to = try cronAgentOptionValue(sub_args, i);
             i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--agent")) {
+            options.agent_id = try cronAgentOptionValue(sub_args, i);
+            i += 1;
         } else {
             return error.UnknownCronOption;
         }
@@ -1000,10 +1004,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  get <id> [--json]             Show one scheduled task
             \\  status [--json]               Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--agent <id>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
-            \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
+            \\  once-agent <delay> <prompt> [--model <model>] [--agent <id>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
@@ -1068,7 +1072,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--agent <id>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std_compat.process.exit(1);
         }
         const options = parseCronAddAgentOptions(sub_args) catch |err| switch (err) {
@@ -1085,7 +1089,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std_compat.process.exit(1);
             },
         };
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery, options.agent_id);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -1094,7 +1098,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--agent <id>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std_compat.process.exit(1);
         }
         const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
@@ -1111,7 +1115,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std_compat.process.exit(1);
             },
         };
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery, options.agent_id);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
