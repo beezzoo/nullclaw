@@ -145,7 +145,12 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
     }
     if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
 
-    std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| switch (err) {
+    // Signal the whole process group (negative pid), not just this PID: the
+    // child was spawned with pgid = its own pid (see the `child.pgid = 0`
+    // assignment at spawn time above), so this also reaches any MCP server
+    // child processes it started — they'd otherwise survive as orphans,
+    // since a SIGKILL'd process never runs its own cleanup defers.
+    std.posix.kill(-child.id, std.posix.SIG.KILL) catch |err| switch (err) {
         error.ProcessNotFound => return,
         else => return err,
     };
@@ -262,6 +267,14 @@ pub fn runWithOptions(
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         child.cwd = exec_cwd;
+        // New process group (pgid = the child's own pid), set atomically by
+        // the standard library between fork and exec — no race window. This
+        // lets terminateChildHard SIGKILL the whole group (subprocess + any
+        // MCP server children it spawns) on timeout instead of just the
+        // subprocess PID, so MCP grandchildren can't survive as orphans when
+        // a SIGKILL'd process never gets to run its own cleanup defers. See
+        // design.md in the fix-mcp-heartbeat-timeout-leak change.
+        child.pgid = 0;
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => {
@@ -379,6 +392,10 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    // Mirrors runWithOptions' spawn (pgid = own pid) — terminateChildHard
+    // signals the process group, so the child must actually be one for the
+    // hard-kill below to reach it.
+    child.pgid = 0;
     try child.spawn();
     errdefer {
         _ = child.kill() catch {};
@@ -406,6 +423,59 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         else => false,
     };
     try std.testing.expect(!completed_ok);
+}
+
+test "terminateChildHard kills grandchild processes via process group" {
+    // Regression test for the 2026-08-16 MCP-subprocess-leak incident: a
+    // hard-timeout kill of the spawned child must also reach any process
+    // that child itself spawned (e.g. an MCP server), not just the child.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{
+        platform.getShell(), platform.getShellFlag(),
+        "sleep 5 & echo $!; wait $!",
+    }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.pgid = 0;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        1,
+        std_compat.time.nanoTimestamp(),
+    );
+    _ = try child.wait();
+    try std.testing.expect(timed_out);
+
+    const grandchild_pid = try std.fmt.parseInt(
+        i32,
+        std.mem.trim(u8, stdout.items, " \n\t\r"),
+        10,
+    );
+
+    // Give the kernel a moment to finish delivering SIGKILL/reaping.
+    std_compat.thread.sleep(200 * std.time.ns_per_ms);
+
+    const still_alive = if (std.posix.kill(grandchild_pid, @enumFromInt(0))) |_| true else |err| switch (err) {
+        error.ProcessNotFound => false,
+        else => true,
+    };
+    try std.testing.expect(!still_alive);
 }
 
 test "buildAgentOutput returns stdout on success" {
