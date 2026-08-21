@@ -932,7 +932,14 @@ pub const Agent = struct {
     }
 
     fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
-        if (parsed_calls_len > 0) return parsed_text;
+        if (parsed_calls_len > 0) {
+            // A tool call parsed successfully, but parsed_text can still carry a
+            // second, malformed/unclosed <tool_call> fragment (e.g. one whose
+            // inner JSON failed to parse) that survived alongside it. Never show
+            // that raw markup to the user — same rule as the branches below.
+            if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            return parsed_text;
+        }
         if (parsed_text.len > 0) {
             // Some malformed/unclosed tool-call payloads can survive into parsed_text
             // via parser recovery fallbacks. Suppress them from user-visible output.
@@ -9813,6 +9820,15 @@ test "Agent selectDisplayText prefers parsed text when present" {
 test "Agent selectDisplayText hides malformed tool markup present in parsed text" {
     const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
     const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
+    try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent selectDisplayText hides leftover tool markup even when a call parsed successfully" {
+    // Regression test for the 2026-08-16/2026-08-21 heartbeat/cron leak
+    // incidents: one call parses fine, but a second, malformed <tool_call>
+    // fragment survives alongside it in parsed_text. Must not leak either.
+    const parsed_with_leftover = "Второй результат не пришёл — повторяю: <tool_call>{\"name\": \"shell\"";
+    const selected = Agent.selectDisplayText(parsed_with_leftover, parsed_with_leftover, 1);
     try std.testing.expectEqualStrings("", selected);
 }
 
