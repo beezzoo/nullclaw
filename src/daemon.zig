@@ -3227,7 +3227,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
-    _ = try runtime.addJob("* * * * *", cmd_runtime);
+    _ = try runtime.addJob("* * * * *", cmd_runtime, .{});
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
@@ -3246,7 +3246,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     var external = CronScheduler.init(allocator, 32, true);
     defer external.deinit();
     try cron.loadJobs(&external);
-    _ = try external.addJob("*/5 * * * *", cmd_external);
+    _ = try external.addJob("*/5 * * * *", cmd_external, .{});
     try cron.saveJobs(&external);
 
     _ = loaded.tick(std_compat.time.timestamp(), null);

@@ -579,7 +579,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a recurring cron job.
-    pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
+    pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
         try self.validateShellCommand(command);
 
@@ -596,13 +596,28 @@ pub const CronScheduler = struct {
             .expression = try self.allocator.dupe(u8, expression),
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
+                .best_effort = delivery.best_effort,
+            },
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 
     /// Add a one-shot delayed task.
-    pub fn addOnce(self: *CronScheduler, delay: []const u8, command: []const u8) !*CronJob {
+    pub fn addOnce(self: *CronScheduler, delay: []const u8, command: []const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
         try self.validateShellCommand(command);
 
@@ -621,6 +636,21 @@ pub const CronScheduler = struct {
             .command = try self.allocator.dupe(u8, command),
             .next_run_secs = now + delay_secs,
             .one_shot = true,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
+                .best_effort = delivery.best_effort,
+            },
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -2229,7 +2259,7 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addJob(expression, command);
+    const job = try scheduler.addJob(expression, command, .{});
     try saveJobs(&scheduler);
 
     log.info("Added cron job {s}", .{job.id});
@@ -2298,7 +2328,7 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addOnce(delay, command);
+    const job = try scheduler.addOnce(delay, command, .{});
     try saveJobs(&scheduler);
 
     log.info("Added one-shot task {s}", .{job.id});
@@ -2794,7 +2824,7 @@ test "CronScheduler add and list" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const job = try scheduler.addJob("*/10 * * * *", "echo roundtrip", .{});
     try std.testing.expectEqualStrings("*/10 * * * *", job.expression);
     try std.testing.expectEqualStrings("echo roundtrip", job.command);
     try std.testing.expect(!job.one_shot);
@@ -2808,15 +2838,58 @@ test "CronScheduler addOnce creates one-shot" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addOnce("30m", "echo once");
+    const job = try scheduler.addOnce("30m", "echo once", .{});
     try std.testing.expect(job.one_shot);
+}
+
+test "CronScheduler addOnce applies delivery routing to shell jobs" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("10m", "echo reminder", .{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "-1003748473332",
+        .thread_id = "1877",
+    });
+
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("-1003748473332", job.delivery.to.?);
+    try std.testing.expectEqualStrings("1877", job.delivery.thread_id.?);
+}
+
+test "CronScheduler addOnce with no delivery keeps default none" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("10m", "echo silent", .{});
+
+    try std.testing.expectEqual(DeliveryMode.none, job.delivery.mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), job.delivery.channel);
+    try std.testing.expectEqual(@as(?[]const u8, null), job.delivery.to);
+}
+
+test "CronScheduler addJob applies delivery routing to recurring shell jobs" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/10 * * * *", "echo reminder", .{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "-1003748473332",
+    });
+
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("-1003748473332", job.delivery.to.?);
 }
 
 test "CronScheduler remove" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/10 * * * *", "echo test");
+    const job = try scheduler.addJob("*/10 * * * *", "echo test", .{});
     try std.testing.expect(scheduler.removeJob(job.id));
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -2825,19 +2898,19 @@ test "CronScheduler generated IDs stay unique after removals" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const j1 = try scheduler.addJob("*/10 * * * *", "echo first");
+    const j1 = try scheduler.addJob("*/10 * * * *", "echo first", .{});
     const j1_id = try std.testing.allocator.dupe(u8, j1.id);
     defer std.testing.allocator.free(j1_id);
-    const j2 = try scheduler.addJob("*/10 * * * *", "echo second");
+    const j2 = try scheduler.addJob("*/10 * * * *", "echo second", .{});
     const j2_id = try std.testing.allocator.dupe(u8, j2.id);
     defer std.testing.allocator.free(j2_id);
-    const j3 = try scheduler.addJob("*/10 * * * *", "echo third");
+    const j3 = try scheduler.addJob("*/10 * * * *", "echo third", .{});
     const j3_id = try std.testing.allocator.dupe(u8, j3.id);
     defer std.testing.allocator.free(j3_id);
 
     try std.testing.expect(scheduler.removeJob(j2_id));
 
-    const j4 = try scheduler.addJob("*/10 * * * *", "echo fourth");
+    const j4 = try scheduler.addJob("*/10 * * * *", "echo fourth", .{});
     try std.testing.expect(!std.mem.eql(u8, j4.id, j1_id));
     try std.testing.expect(!std.mem.eql(u8, j4.id, j3_id));
 }
@@ -2846,7 +2919,7 @@ test "CronScheduler pause and resume" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo pause");
+    const job = try scheduler.addJob("*/5 * * * *", "echo pause", .{});
     try std.testing.expect(scheduler.pauseJob(job.id));
     try std.testing.expect(scheduler.getJob(job.id).?.paused);
     try std.testing.expect(scheduler.resumeJob(job.id));
@@ -2857,15 +2930,15 @@ test "CronScheduler max tasks enforced" {
     var scheduler = CronScheduler.init(std.testing.allocator, 1, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("*/10 * * * *", "echo first");
-    try std.testing.expectError(error.MaxTasksReached, scheduler.addJob("*/11 * * * *", "echo second"));
+    _ = try scheduler.addJob("*/10 * * * *", "echo first", .{});
+    try std.testing.expectError(error.MaxTasksReached, scheduler.addJob("*/11 * * * *", "echo second", .{}));
 }
 
 test "CronScheduler getJob found and missing" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo found");
+    const job = try scheduler.addJob("*/5 * * * *", "echo found", .{});
     try std.testing.expect(scheduler.getJob(job.id) != null);
     try std.testing.expect(scheduler.getJob("nonexistent") == null);
 }
@@ -2879,14 +2952,14 @@ test "save and load roundtrip" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip", .{});
     if (scheduler.getMutableJob(recurring.id)) |job| {
         job.last_run_secs = 1_772_455_140;
         job.last_status = "ok";
     } else {
         return error.TestUnexpectedResult;
     }
-    _ = try scheduler.addOnce("5m", "echo oneshot");
+    _ = try scheduler.addOnce("5m", "echo oneshot", .{});
 
     // Save to disk
     try saveJobs(&scheduler);
@@ -2978,7 +3051,7 @@ test "save and load roundtrip keeps delivery account routing" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/10 * * * *", "echo routed");
+    const job = try scheduler.addJob("*/10 * * * *", "echo routed", .{});
     if (scheduler.getMutableJob(job.id)) |mutable_job| {
         mutable_job.delivery = .{
             .mode = .always,
@@ -3019,7 +3092,7 @@ test "cliRunJob persists last status and timestamp" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("* * * * *", "echo cli_run_status");
+    const job = try scheduler.addJob("* * * * *", "echo cli_run_status", .{});
     const job_id = try std.testing.allocator.dupe(u8, job.id);
     defer std.testing.allocator.free(job_id);
     try saveJobs(&scheduler);
@@ -3055,7 +3128,7 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
-    _ = try scheduler.addJob("*/10 * * * *", "echo keep");
+    _ = try scheduler.addJob("*/10 * * * *", "echo keep", .{});
     try saveJobs(&scheduler);
 
     var runtime = CronScheduler.init(std.testing.allocator, 10, true);
@@ -3090,7 +3163,7 @@ test "save and load roundtrip with JSON-sensitive command characters" {
     scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
-    _ = try scheduler.addJob("*/5 * * * *", cmd);
+    _ = try scheduler.addJob("*/5 * * * *", cmd, .{});
 
     try saveJobs(&scheduler);
 
@@ -3281,7 +3354,7 @@ test "getMutableJob returns mutable pointer" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
-    _ = try scheduler.addJob("* * * * *", "echo test");
+    _ = try scheduler.addJob("* * * * *", "echo test", .{});
     const jobs = scheduler.listJobs();
     const id = jobs[0].id;
     const job = scheduler.getMutableJob(id);
@@ -3293,7 +3366,7 @@ test "updateJob modifies job fields" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
-    _ = try scheduler.addJob("* * * * *", "echo original");
+    _ = try scheduler.addJob("* * * * *", "echo original", .{});
     const jobs = scheduler.listJobs();
     const id = jobs[0].id;
     const patch = CronJobPatch{ .command = "echo updated", .enabled = false, .session_target = .main };
@@ -3313,7 +3386,7 @@ test "cron shell add rejects command blocked by security policy" {
     const allowed = [_][]const u8{"cat"};
     scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
 
-    try std.testing.expectError(error.CommandNotAllowed, scheduler.addJob("* * * * *", "echo blocked"));
+    try std.testing.expectError(error.CommandNotAllowed, scheduler.addJob("* * * * *", "echo blocked", .{}));
 }
 
 test "cron shell update rejects command blocked by security policy" {
@@ -3321,7 +3394,7 @@ test "cron shell update rejects command blocked by security policy" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("* * * * *", "echo original");
+    _ = try scheduler.addJob("* * * * *", "echo original", .{});
     const id = scheduler.listJobs()[0].id;
 
     const allowed = [_][]const u8{"cat"};
@@ -3336,7 +3409,7 @@ test "cron shell tick blocks previously stored command when policy changes" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("* * * * *", "echo stored");
+    _ = try scheduler.addJob("* * * * *", "echo stored", .{});
     scheduler.jobs.items[0].next_run_secs = 0;
 
     const allowed = [_][]const u8{"cat"};
@@ -3396,7 +3469,7 @@ test "addRun and listRuns" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
-    _ = try scheduler.addJob("* * * * *", "echo test");
+    _ = try scheduler.addJob("* * * * *", "echo test", .{});
     const jobs = scheduler.listJobs();
     const id = jobs[0].id;
     try scheduler.addRun(allocator, id, 1000, 1001, "success", "output", 10);
@@ -3410,7 +3483,7 @@ test "addRun prunes history" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
-    _ = try scheduler.addJob("* * * * *", "echo test");
+    _ = try scheduler.addJob("* * * * *", "echo test", .{});
     const jobs = scheduler.listJobs();
     const id = jobs[0].id;
     // Add 5 runs with max_history=3
@@ -3428,8 +3501,8 @@ test "listRuns returns only matching job runs when interleaved" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("* * * * *", "echo a");
-    _ = try scheduler.addJob("* * * * *", "echo b");
+    _ = try scheduler.addJob("* * * * *", "echo a", .{});
+    _ = try scheduler.addJob("* * * * *", "echo b", .{});
 
     const job_a_id = try allocator.dupe(u8, scheduler.listJobs()[0].id);
     defer allocator.free(job_a_id);
@@ -3680,7 +3753,7 @@ test "one-shot job deleted after tick execution" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addOnce("1s", "echo oneshot");
+    const job = try scheduler.addOnce("1s", "echo oneshot", .{});
     // Verify job was created
     try std.testing.expect(job.one_shot);
     try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
@@ -3707,7 +3780,7 @@ test "shell job uses configured cwd for relative output paths" {
     scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
     defer scheduler.deinit();
 
-    _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
+    _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt", .{});
     scheduler.jobs.items[0].next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), null);
@@ -3724,7 +3797,7 @@ test "shell job delivers stdout via bus" {
     var test_bus = bus.Bus.init();
     defer test_bus.close();
 
-    const job = try scheduler.addJob("* * * * *", "echo hello_cron");
+    const job = try scheduler.addJob("* * * * *", "echo hello_cron", .{});
     _ = job;
 
     // Configure delivery
@@ -3915,7 +3988,7 @@ test "tick without bus still executes jobs" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("* * * * *", "echo silent");
+    _ = try scheduler.addJob("* * * * *", "echo silent", .{});
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick with null bus — should not crash
@@ -3978,7 +4051,7 @@ test "tick records cron start delivery attribution" {
     var observer = RecordingObserver{};
     scheduler.observer = observer.observer();
 
-    _ = try scheduler.addJob("* * * * *", "echo attributed");
+    _ = try scheduler.addJob("* * * * *", "echo attributed", .{});
     scheduler.jobs.items[0].delivery.channel = "telegram";
     scheduler.jobs.items[0].delivery.account_id = "bot-main";
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -3996,7 +4069,7 @@ test "tick reschedules recurring job using cron expression" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("*/10 * * * *", "echo periodic");
+    _ = try scheduler.addJob("*/10 * * * *", "echo periodic", .{});
     scheduler.jobs.items[0].next_run_secs = 0;
 
     _ = scheduler.tick(0, null);
@@ -4008,7 +4081,7 @@ test "tick reschedules anchored recurring job using cron expression" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
+    _ = try scheduler.addJob("8/25 * * * *", "echo anchored", .{});
     scheduler.jobs.items[0].next_run_secs = 480;
 
     _ = scheduler.tick(480, null);
@@ -4062,7 +4135,7 @@ test "buildJobsJson serializes cron jobs for CLI read-side" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello", .{});
     _ = scheduler.pauseJob(job.id);
 
     const json = try buildJobsJson(std.testing.allocator, scheduler.listJobs());
@@ -4112,7 +4185,7 @@ test "cron register + cancel leaks zero bytes for every job kind" {
     defer sched.deinit();
 
     // Recurring shell job.
-    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring", .{});
     // dupe the id because removeJob takes ownership of (frees) the matched
     // job's heap-owned id; passing the original `recurring.id` slice would
     // be a use-after-free pattern.
@@ -4122,7 +4195,7 @@ test "cron register + cancel leaks zero bytes for every job kind" {
     try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
 
     // One-shot shell job: extra `@once:<delay>` expression allocation.
-    const once = try sched.addOnce("10m", "echo once");
+    const once = try sched.addOnce("10m", "echo once", .{});
     const once_id = try alloc.dupe(u8, once.id);
     defer alloc.free(once_id);
     try std.testing.expect(sched.removeJob(once_id));

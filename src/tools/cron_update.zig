@@ -167,7 +167,7 @@ test "cron_update_expression" {
     // First create a job via CronScheduler so there's something to update
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
+    const job = try scheduler.addJob("*/5 * * * *", "echo test", .{});
     cron.saveJobs(&scheduler) catch {};
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"expression\": \"*/10 * * * *\"}}", .{job.id});
@@ -188,7 +188,7 @@ test "cron_update_disable" {
     const t = ct.tool();
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
+    const job = try scheduler.addJob("*/5 * * * *", "echo test", .{});
     cron.saveJobs(&scheduler) catch {};
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"enabled\": false}}", .{job.id});
@@ -260,7 +260,7 @@ test "cron_update rejects agent_id for shell jobs" {
     const t = ct.tool();
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
+    const job = try scheduler.addJob("*/5 * * * *", "echo test", .{});
     cron.saveJobs(&scheduler) catch {};
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"agent_id\": \"taskmaster\"}}", .{job.id});

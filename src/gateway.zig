@@ -3315,7 +3315,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing command or prompt\"}";
                 return;
             };
-            break :blk sched.addOnce(delay, cmd) catch |err| {
+            break :blk sched.addOnce(delay, cmd, delivery) catch |err| {
                 ctx.response_status = "400 Bad Request";
                 ctx.response_body = if (err == error.MaxTasksReached)
                     "{\"error\":\"max tasks reached\"}"
@@ -3343,7 +3343,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"missing command or prompt\"}";
             return;
         };
-        break :blk sched.addJob(expression_opt.?, cmd) catch |err| {
+        break :blk sched.addJob(expression_opt.?, cmd, delivery) catch |err| {
             ctx.response_status = "400 Bad Request";
             ctx.response_body = if (err == error.MaxTasksReached)
                 "{\"error\":\"max tasks reached\"}"
@@ -6723,6 +6723,134 @@ test "handleCronAdd supports one-shot delay payloads" {
     try std.testing.expect(jobs[0].one_shot);
     try std.testing.expect(std.mem.startsWith(u8, jobs[0].expression, "@once:"));
     try std.testing.expectEqualStrings("echo once", jobs[0].command);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.none, jobs[0].delivery.mode);
+}
+
+test "handleCronAdd preserves delivery routing for one-shot shell payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"10m\",\"command\":\"echo reminder\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_to\":\"-1003748473332\",\"delivery_thread_id\":\"1877\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].one_shot);
+    try std.testing.expectEqualStrings("echo reminder", jobs[0].command);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.always, jobs[0].delivery.mode);
+    try std.testing.expectEqualStrings("telegram", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("-1003748473332", jobs[0].delivery.to.?);
+    try std.testing.expectEqualStrings("1877", jobs[0].delivery.thread_id.?);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, req_allocator, ctx.response_body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("always", parsed.value.object.get("delivery_mode").?.string);
+    try std.testing.expectEqualStrings("-1003748473332", parsed.value.object.get("delivery_to").?.string);
+}
+
+test "handleCronAdd preserves delivery routing for recurring shell payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"0 8 * * *\",\"command\":\"echo daily report\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_to\":\"-1003748473332\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(!jobs[0].one_shot);
+    try std.testing.expectEqualStrings("echo daily report", jobs[0].command);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.always, jobs[0].delivery.mode);
+    try std.testing.expectEqualStrings("telegram", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("-1003748473332", jobs[0].delivery.to.?);
+}
+
+test "handleCronAdd shell payload with no delivery fields defaults to none" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"0 8 * * *\",\"command\":\"echo silent\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.none, jobs[0].delivery.mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), jobs[0].delivery.channel);
+    try std.testing.expectEqual(@as(?[]const u8, null), jobs[0].delivery.to);
 }
 
 test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
@@ -6878,7 +7006,7 @@ test "handleCronUpdate accepts session_target" {
 test "handleCronUpdate rejects session_target for shell jobs" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("* * * * *", "echo hello");
+    const job = try scheduler.addJob("* * * * *", "echo hello", .{});
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
 
@@ -7061,7 +7189,7 @@ test "handleCronUpdate accepts agent_id for agent jobs" {
 test "handleCronUpdate rejects agent_id for shell jobs" {
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("* * * * *", "echo hello");
+    const job = try scheduler.addJob("* * * * *", "echo hello", .{});
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
 

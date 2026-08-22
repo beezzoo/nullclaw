@@ -124,7 +124,7 @@ test "cron_runs_no_history" {
     // Create a scheduler with a job but no runs (no file I/O)
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
-    const job = try scheduler.addJob("* * * * *", "echo test");
+    const job = try scheduler.addJob("* * * * *", "echo test", .{});
     const job_id = job.id;
 
     // Verify no runs exist
@@ -148,7 +148,7 @@ test "cron_runs_shows_history" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello", .{});
     const job_id = job.id;
 
     try scheduler.addRun(allocator, job_id, 1000, 1001, "success", "hello world", 10);

@@ -261,43 +261,13 @@ pub const ScheduleTool = struct {
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }
             else
-                scheduler.addJob(expression, command.?) catch |err| {
+                scheduler.addJob(expression, command.?, gateway_delivery orelse .{}) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
 
             if (prompt != null) {
                 job.session_target = session_target;
-            }
-
-            // Shell jobs duplicate delivery routing locally because addJob() has no delivery parameter.
-            if (prompt == null) {
-                if (chat_id) |cid| {
-                    const owned_peer_id = if (context_routing_allowed and tls_schedule_peer_id != null)
-                        try allocator.dupe(u8, tls_schedule_peer_id.?)
-                    else
-                        null;
-                    errdefer if (owned_peer_id) |value| allocator.free(value);
-                    const owned_thread_id = if (context_routing_allowed and tls_schedule_thread_id != null)
-                        try allocator.dupe(u8, tls_schedule_thread_id.?)
-                    else
-                        null;
-                    errdefer if (owned_thread_id) |value| allocator.free(value);
-                    job.delivery = cron.enrichDeliveryRouting(.{
-                        .mode = .always,
-                        .channel = try allocator.dupe(u8, delivery_channel),
-                        .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
-                        .to = try allocator.dupe(u8, cid),
-                        .peer_kind = if (context_routing_allowed) tls_schedule_peer_kind else null,
-                        .peer_id = owned_peer_id,
-                        .thread_id = owned_thread_id,
-                        .channel_owned = true,
-                        .account_id_owned = delivery_account_id != null,
-                        .to_owned = true,
-                        .peer_id_owned = owned_peer_id != null,
-                        .thread_id_owned = owned_thread_id != null,
-                    });
-                }
             }
 
             cron.saveJobs(&scheduler) catch {};
@@ -388,7 +358,7 @@ pub const ScheduleTool = struct {
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }
             else
-                scheduler.addOnce(delay, command.?) catch |err| {
+                scheduler.addOnce(delay, command.?, gateway_delivery orelse .{}) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
@@ -396,34 +366,6 @@ pub const ScheduleTool = struct {
             if (prompt != null) {
                 job.session_target = session_target;
             }
-
-            // Shell jobs duplicate delivery routing locally because addOnce() has no delivery parameter.
-            if (prompt == null) if (chat_id) |cid| {
-                const owned_peer_id = if (context_routing_allowed and tls_schedule_peer_id != null)
-                    try allocator.dupe(u8, tls_schedule_peer_id.?)
-                else
-                    null;
-                errdefer if (owned_peer_id) |value| allocator.free(value);
-                const owned_thread_id = if (context_routing_allowed and tls_schedule_thread_id != null)
-                    try allocator.dupe(u8, tls_schedule_thread_id.?)
-                else
-                    null;
-                errdefer if (owned_thread_id) |value| allocator.free(value);
-                job.delivery = cron.enrichDeliveryRouting(.{
-                    .mode = .always,
-                    .channel = try allocator.dupe(u8, delivery_channel),
-                    .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
-                    .to = try allocator.dupe(u8, cid),
-                    .peer_kind = if (context_routing_allowed) tls_schedule_peer_kind else null,
-                    .peer_id = owned_peer_id,
-                    .thread_id = owned_thread_id,
-                    .channel_owned = true,
-                    .account_id_owned = delivery_account_id != null,
-                    .to_owned = true,
-                    .peer_id_owned = owned_peer_id != null,
-                    .thread_id_owned = owned_thread_id != null,
-                });
-            };
 
             cron.saveJobs(&scheduler) catch {};
 

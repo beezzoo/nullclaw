@@ -134,7 +134,7 @@ test "cron_run_executes_command" {
     defer scheduler.deinit();
     cron.loadJobs(&scheduler) catch {};
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello", .{});
     const job_id = try std.testing.allocator.dupe(u8, job.id);
     defer std.testing.allocator.free(job_id);
 

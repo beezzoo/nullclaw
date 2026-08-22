@@ -79,7 +79,7 @@ test "cron_list_with_jobs" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello", .{});
     try std.testing.expect(scheduler.listJobs().len == 1);
 
     // Format output the same way the tool does, to verify content
@@ -105,7 +105,7 @@ test "cron_list_shows_paused" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("0 * * * *", "echo paused_test");
+    const job = try scheduler.addJob("0 * * * *", "echo paused_test", .{});
     try std.testing.expect(scheduler.pauseJob(job.id));
 
     const jobs = scheduler.listJobs();

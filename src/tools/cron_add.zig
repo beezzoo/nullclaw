@@ -67,7 +67,7 @@ pub const CronAddTool = struct {
 
         // Prefer expression (recurring) over delay (one-shot)
         if (expression) |expr| {
-            const job = scheduler.addJob(expr, command) catch |err| {
+            const job = scheduler.addJob(expr, command, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
@@ -83,7 +83,7 @@ pub const CronAddTool = struct {
         }
 
         if (delay) |d| {
-            const job = scheduler.addOnce(d, command) catch |err| {
+            const job = scheduler.addOnce(d, command, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
