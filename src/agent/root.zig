@@ -360,6 +360,14 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// When true, print intermediary (non-final) tool-calling narration to
+    /// stdout during turn() iterations. Only a genuinely-interactive terminal
+    /// REPL session should opt into this; single-shot `-m` CLI runs (whose
+    /// stdout is captured verbatim as delivered subprocess output by
+    /// agent_runner.zig for heartbeat/cron) and SessionManager-owned Agents
+    /// (which never read stdout) must leave this false, or intermediary
+    /// narration leaks into cron/heartbeat-delivered messages.
+    print_intermediate_tool_text: bool = false,
     /// Optional progress hint callback. When set, called on tool_call_start events.
     progress_callback: ?ProgressCallback = null,
     /// Context pointer passed to progress_callback.
@@ -2712,10 +2720,13 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text.
+            // There are tool calls — print intermediary text, but only for a
+            // genuinely-interactive terminal session (see print_intermediate_tool_text
+            // doc comment) — single-shot `-m` runs (heartbeat/cron subprocess output)
+            // must not have this polluting the delivered message.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            if (!builtin.is_test and self.print_intermediate_tool_text and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std_compat.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;

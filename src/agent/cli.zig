@@ -766,6 +766,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
+    // Interactive REPL — a human is watching this terminal, so show
+    // intermediary tool-calling narration as it happens. `-m` single-shot
+    // mode (below) leaves this false: its stdout is captured verbatim as
+    // the delivered message for heartbeat/cron subprocess runs.
+    agent.print_intermediate_tool_text = true;
 
     if (cost_tracker) |*c_tracker| {
         agent.usage_record_callback = cliUsageRecordCallback;
