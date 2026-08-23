@@ -280,6 +280,28 @@ pub const Config = struct {
         return self.security.sandbox.enabled orelse true;
     }
 
+    const WebTokenIdentityValue = struct {
+        value: []const u8,
+        /// Whether `value` was allocated (env-sourced) and must be freed, as
+        /// opposed to borrowed from the config's own `token` field.
+        owned: bool,
+    };
+
+    /// Resolve one `WebTokenIdentity` entry's actual token value, for validation.
+    /// Returns null when neither source yields a value (token_env missing/empty
+    /// from the environment) - the caller has already confirmed exactly one of
+    /// `token`/`token_env` is set.
+    fn resolveWebTokenIdentityValue(allocator: std.mem.Allocator, entry: config_types.WebTokenIdentity) ?WebTokenIdentityValue {
+        if (entry.token) |literal| return .{ .value = literal, .owned = false };
+        const env_name = entry.token_env orelse return null;
+        const raw = std_compat.process.getEnvVarOwned(allocator, env_name) catch return null;
+        if (raw.len == 0) {
+            allocator.free(raw);
+            return null;
+        }
+        return .{ .value = raw, .owned = true };
+    }
+
     fn sanitizeStatePathSegment(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -1581,6 +1603,14 @@ pub const Config = struct {
         InvalidTeamsWebhookSecret,
         InvalidWebMessageAuthMode,
         InvalidWebMessageAuthTransport,
+        InvalidWebTokenIdentitySource,
+        InvalidWebTokenIdentityCanonical,
+        InvalidWebTokenIdentityToken,
+        MissingWebTokenEnvVar,
+        DuplicateWebTokenIdentityCanonical,
+        DuplicateWebTokenIdentityToken,
+        WebTokensRequireTokenAuthMode,
+        WebTokensConflictWithAuthToken,
         InvalidWebOrigin,
         MissingWebRelayUrl,
         InvalidWebRelayUrl,
@@ -1767,6 +1797,46 @@ pub const Config = struct {
             if (!config_types.WebConfig.isValidMessageAuthMode(web_cfg.message_auth_mode)) {
                 return ValidationError.InvalidWebMessageAuthMode;
             }
+            if (web_cfg.tokens.len > 0) {
+                if (web_cfg.auth_token) |shared_token| {
+                    if (std.mem.trim(u8, shared_token, " \t\r\n").len > 0) {
+                        return ValidationError.WebTokensConflictWithAuthToken;
+                    }
+                }
+                if (!config_types.WebConfig.isTokenMessageAuthMode(web_cfg.message_auth_mode)) {
+                    return ValidationError.WebTokensRequireTokenAuthMode;
+                }
+                for (web_cfg.tokens, 0..) |entry, i| {
+                    const has_token = entry.token != null;
+                    const has_env = entry.token_env != null;
+                    if (has_token == has_env) {
+                        return ValidationError.InvalidWebTokenIdentitySource;
+                    }
+                    if (!config_types.WebConfig.isValidTokenIdentityCanonical(entry.canonical)) {
+                        return ValidationError.InvalidWebTokenIdentityCanonical;
+                    }
+                    for (web_cfg.tokens[0..i]) |prior| {
+                        if (std.mem.eql(u8, entry.canonical, prior.canonical)) {
+                            return ValidationError.DuplicateWebTokenIdentityCanonical;
+                        }
+                    }
+
+                    const resolved = resolveWebTokenIdentityValue(self.allocator, entry) orelse {
+                        return ValidationError.MissingWebTokenEnvVar;
+                    };
+                    defer if (resolved.owned) self.allocator.free(@constCast(resolved.value));
+                    if (!config_types.WebConfig.isValidAuthToken(resolved.value)) {
+                        return ValidationError.InvalidWebTokenIdentityToken;
+                    }
+                    for (web_cfg.tokens[0..i]) |prior| {
+                        const prior_resolved = resolveWebTokenIdentityValue(self.allocator, prior) orelse continue;
+                        defer if (prior_resolved.owned) self.allocator.free(@constCast(prior_resolved.value));
+                        if (std.mem.eql(u8, resolved.value, prior_resolved.value)) {
+                            return ValidationError.DuplicateWebTokenIdentityToken;
+                        }
+                    }
+                }
+            }
             if (relay_transport and config_types.WebConfig.isTokenMessageAuthMode(web_cfg.message_auth_mode)) {
                 return ValidationError.InvalidWebMessageAuthTransport;
             }
@@ -1864,6 +1934,14 @@ pub const Config = struct {
             ValidationError.InvalidTeamsWebhookSecret => std.debug.print("Config error: channels.teams.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
             ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
+            ValidationError.InvalidWebTokenIdentitySource => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] entries must set exactly one of 'token' or 'token_env'.\n", .{}),
+            ValidationError.InvalidWebTokenIdentityCanonical => std.debug.print("Config error: channels.web.accounts.<id>.tokens[].canonical must be non-empty, <=64 bytes, and contain only [A-Za-z0-9._-].\n", .{}),
+            ValidationError.InvalidWebTokenIdentityToken => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] token value must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.MissingWebTokenEnvVar => std.debug.print("Config error: channels.web.accounts.<id>.tokens[].token_env names an environment variable that is unset or empty.\n", .{}),
+            ValidationError.DuplicateWebTokenIdentityCanonical => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] has duplicate canonical identities.\n", .{}),
+            ValidationError.DuplicateWebTokenIdentityToken => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] has duplicate token values.\n", .{}),
+            ValidationError.WebTokensRequireTokenAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] requires message_auth_mode='token'.\n", .{}),
+            ValidationError.WebTokensConflictWithAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.tokens[] and auth_token are mutually exclusive.\n", .{}),
             ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*', 'null', or absolute origins (scheme://...).\n", .{}),
             ValidationError.MissingWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url is required when transport='relay'.\n", .{}),
             ValidationError.InvalidWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url must be an absolute wss:// URL.\n", .{}),
@@ -3872,6 +3950,229 @@ test "validation rejects token message_auth_mode for relay transport" {
         },
     };
     try std.testing.expectError(Config.ValidationError.InvalidWebMessageAuthTransport, cfg.validate());
+}
+
+test "validation accepts a well-formed identity-bound web config" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .canonical = "beezzoo" },
+                .{ .token = "admin-token-01234567890", .canonical = "admin" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try cfg.validate();
+}
+
+test "validation rejects tokens[] entry with both token and token_env set" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .token_env = "NULLCLAW_WEB_TOKEN_BEEZZOO", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebTokenIdentitySource, cfg.validate());
+}
+
+test "validation rejects tokens[] entry with neither token nor token_env set" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebTokenIdentitySource, cfg.validate());
+}
+
+test "validation rejects tokens[] entry with invalid canonical" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .canonical = "" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebTokenIdentityCanonical, cfg.validate());
+}
+
+test "validation rejects tokens[] entry with too-short literal token" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "short", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebTokenIdentityToken, cfg.validate());
+}
+
+test "validation rejects tokens[] entry with missing token_env" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token_env = "NULLCLAW_TEST_TOKEN_IDENTITY_UNSET_ZZZ", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.MissingWebTokenEnvVar, cfg.validate());
+}
+
+test "validation rejects duplicate canonical identities in tokens[]" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .canonical = "beezzoo" },
+                .{ .token = "admin-token-01234567890", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.DuplicateWebTokenIdentityCanonical, cfg.validate());
+}
+
+test "validation rejects duplicate token values in tokens[]" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .tokens = &.{
+                .{ .token = "shared-token-0123456789", .canonical = "beezzoo" },
+                .{ .token = "shared-token-0123456789", .canonical = "admin" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.DuplicateWebTokenIdentityToken, cfg.validate());
+}
+
+test "validation rejects tokens[] without message_auth_mode=token" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.WebTokensRequireTokenAuthMode, cfg.validate());
+}
+
+test "validation rejects tokens[] alongside a populated auth_token" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "token",
+            .auth_token = "shared-account-token-0123",
+            .tokens = &.{
+                .{ .token = "beezzoo-token-0123456789", .canonical = "beezzoo" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.WebTokensConflictWithAuthToken, cfg.validate());
 }
 
 test "validation rejects relay transport without relay_url" {

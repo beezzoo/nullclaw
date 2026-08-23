@@ -57,6 +57,15 @@ pub const WebChannel = struct {
         invalid,
     };
 
+    /// A resolved (token value, canonical identity) pair for identity-bound mode.
+    /// `token` is always owned by the channel (duped at resolution time, whether
+    /// the source was a literal config value or an env var), freed uniformly on
+    /// `stopLocalTransport`.
+    const IdentityToken = struct {
+        token: []const u8,
+        canonical: []const u8,
+    };
+
     allocator: std.mem.Allocator,
     transport: WebTransport,
     port: u16,
@@ -76,11 +85,20 @@ pub const WebChannel = struct {
     relay_e2e_required: bool,
     message_auth_mode: MessageAuthMode,
     bus: ?*bus_mod.Bus = null,
+    /// Identity-bound token table from config, as-is (may reference env var
+    /// names not yet resolved). Non-empty activates identity-bound mode.
+    configured_tokens: []const config_types.WebTokenIdentity = &.{},
 
-    // Active auth token (configured/env/generate).
+    // Active auth token (configured/env/generate). Unused when identity-bound
+    // (configured_tokens non-empty) - see identity_tokens instead.
     token: [128]u8 = [_]u8{0} ** 128,
     token_len: u8 = 0,
     token_initialized: bool = false,
+
+    // Resolved identity-bound tokens (env vars read, values owned). Populated by
+    // startLocalTransport when configured_tokens is non-empty, freed by
+    // stopLocalTransport.
+    identity_tokens: []const IdentityToken = &.{},
 
     // Runtime state
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -183,6 +201,7 @@ pub const WebChannel = struct {
             .relay_ui_token_ttl_secs = cfg.relay_ui_token_ttl_secs,
             .relay_e2e_required = cfg.relay_e2e_required,
             .message_auth_mode = parseMessageAuthMode(cfg.message_auth_mode),
+            .configured_tokens = cfg.tokens,
         };
     }
 
@@ -573,6 +592,46 @@ pub const WebChannel = struct {
         var diff: u8 = 0;
         for (candidate, active) |a, b| diff |= a ^ b;
         return diff == 0;
+    }
+
+    /// Resolve a presented bearer token against the identity-bound table,
+    /// returning the matched entry's canonical identity or null.
+    ///
+    /// Constant-time: scans every entry with no early exit, so neither whether
+    /// a match exists nor which entry matched can be inferred from timing.
+    pub fn resolveTokenIdentity(self: *const WebChannel, candidate: []const u8) ?[]const u8 {
+        var matched: ?[]const u8 = null;
+        for (self.identity_tokens) |entry| {
+            if (pairing_mod.constantTimeEq(candidate, entry.token)) matched = entry.canonical;
+        }
+        return matched;
+    }
+
+    /// Identity-bound mode requires a token on every connection attempt,
+    /// including loopback binds - unlike the pairing-mode fallback, which
+    /// allows an unauthenticated loopback upgrade. Returns the resolved
+    /// canonical identity, or null to reject the connection.
+    fn resolveIdentityBoundHandshake(self: *const WebChannel, presented_token: ?[]const u8) ?[]const u8 {
+        const candidate = presented_token orelse return null;
+        return self.resolveTokenIdentity(candidate);
+    }
+
+    /// Resolve the session_id a handshake should bind to. For an identity-bound
+    /// connection, the resolved identity always wins over any client-supplied
+    /// session_id query parameter (which is ignored, with a warning if it
+    /// differed). Otherwise, falls back to the existing query-param-or-default
+    /// behavior.
+    fn resolveHandshakeSessionId(identity: ?[]const u8, query_session_id: ?[]const u8) []const u8 {
+        if (identity) |canonical| {
+            if (query_session_id) |q| {
+                if (!std.mem.eql(u8, q, canonical)) {
+                    log.warn("WS: ignoring session_id query override for identity-bound connection (resolved identity={s})", .{canonical});
+                }
+            }
+            return canonical;
+        }
+        const sid_raw = query_session_id orelse "default";
+        return if (sid_raw.len == 0) "default" else sid_raw;
     }
 
     fn activeToken(self: *const WebChannel) []const u8 {
@@ -1073,21 +1132,61 @@ pub const WebChannel = struct {
         }
     }
 
-    fn startLocalTransport(self: *WebChannel) !void {
-        var token_source: LocalTokenSource = .ephemeral;
-        if (self.configured_auth_token) |token| {
-            try self.setActiveToken(token);
-            token_source = .config;
-            log.info("Web channel auth token loaded from channels.web auth_token", .{});
-        } else if (try self.loadLocalTokenFromEnv()) {
-            token_source = .env;
-        } else {
-            self.generateToken();
-            token_source = .ephemeral;
-            log.warn("Web channel using ephemeral auth token for this run", .{});
+    /// Resolve `configured_tokens` into owned `identity_tokens`, reading any
+    /// `token_env` values from the environment. `Config.validate()` already
+    /// guarantees each entry resolves to a valid, present value at config-load
+    /// time; this re-resolves at channel start (env vars, not config data, so
+    /// re-reading is required) and fails startup defensively if that guarantee
+    /// somehow no longer holds.
+    fn resolveIdentityTokens(self: *WebChannel) !void {
+        const list = try self.allocator.alloc(IdentityToken, self.configured_tokens.len);
+        errdefer self.allocator.free(list);
+        var resolved: usize = 0;
+        errdefer for (list[0..resolved]) |entry| self.allocator.free(@constCast(entry.token));
+
+        for (self.configured_tokens, 0..) |entry, i| {
+            const value: []u8 = if (entry.token) |literal|
+                try self.allocator.dupe(u8, literal)
+            else if (entry.token_env) |env_name|
+                std_compat.process.getEnvVarOwned(self.allocator, env_name) catch |err| {
+                    log.err("Web channel identity-bound token env {s} unavailable at startup: {}", .{ env_name, err });
+                    return error.InvalidConfiguration;
+                }
+            else
+                unreachable; // Config.validate() guarantees exactly one of token/token_env.
+
+            list[i] = .{ .token = value, .canonical = entry.canonical };
+            resolved = i + 1;
         }
 
-        try self.ensureLocalTokenSourceCompatible(token_source);
+        self.identity_tokens = list;
+        log.info("Web channel identity-bound mode active with {d} configured identities", .{list.len});
+    }
+
+    fn startLocalTransport(self: *WebChannel) !void {
+        if (self.configured_tokens.len > 0) {
+            try self.resolveIdentityTokens();
+        } else {
+            var token_source: LocalTokenSource = .ephemeral;
+            if (self.configured_auth_token) |token| {
+                try self.setActiveToken(token);
+                token_source = .config;
+                log.info("Web channel auth token loaded from channels.web auth_token", .{});
+            } else if (try self.loadLocalTokenFromEnv()) {
+                token_source = .env;
+            } else {
+                self.generateToken();
+                token_source = .ephemeral;
+                log.warn("Web channel using ephemeral auth token for this run", .{});
+            }
+
+            try self.ensureLocalTokenSourceCompatible(token_source);
+
+            switch (token_source) {
+                .ephemeral => log.warn("Web channel generated an optional upgrade token for this run (hidden in logs); set channels.web.auth_token or NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN for stable automation", .{}),
+                .config, .env => log.info("Web channel optional upgrade auth token active (hidden in logs)", .{}),
+            }
+        }
 
         try self.initRelaySecurityState();
         errdefer self.deinitRelaySecurityState();
@@ -1115,10 +1214,6 @@ pub const WebChannel = struct {
         };
 
         log.info("Web channel ready on ws://{s}:{d}{s}", .{ self.listen_address, self.port, self.ws_path });
-        switch (token_source) {
-            .ephemeral => log.warn("Web channel generated an optional upgrade token for this run (hidden in logs); set channels.web.auth_token or NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN for stable automation", .{}),
-            .config, .env => log.info("Web channel optional upgrade auth token active (hidden in logs)", .{}),
-        }
         self.warnIfOriginAllowlistBroad();
         if (self.message_auth_mode == .token) {
             log.info("Web channel user_message auth mode: token", .{});
@@ -1265,6 +1360,12 @@ pub const WebChannel = struct {
             self.server = null;
         }
         self.deinitRelaySecurityState();
+
+        if (self.identity_tokens.len > 0) {
+            for (self.identity_tokens) |entry| self.allocator.free(@constCast(entry.token));
+            self.allocator.free(@constCast(self.identity_tokens));
+            self.identity_tokens = &.{};
+        }
     }
 
     fn stopRelayTransport(self: *WebChannel) void {
@@ -1476,13 +1577,28 @@ pub const WebChannel = struct {
                 };
             },
             .token => {
-                const inbound_token = auth_token orelse access_token orelse {
-                    self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is required");
-                    return;
-                };
-                if (!self.validateToken(inbound_token)) {
-                    self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is invalid");
-                    return;
+                if (self.identity_tokens.len > 0) {
+                    // Identity-bound: the connection already authenticated at
+                    // handshake time, so a per-message token is optional. If one
+                    // is present, it must resolve to this same connection's
+                    // identity (session_id, forced from the handshake) - not
+                    // merely be *a* valid identity-bound token.
+                    if (auth_token orelse access_token) |presented| {
+                        const presented_identity = self.resolveTokenIdentity(presented);
+                        if (presented_identity == null or !std.mem.eql(u8, presented_identity.?, session_id)) {
+                            self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is invalid");
+                            return;
+                        }
+                    }
+                } else {
+                    const inbound_token = auth_token orelse access_token orelse {
+                        self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is required");
+                        return;
+                    };
+                    if (!self.validateToken(inbound_token)) {
+                        self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is invalid");
+                        return;
+                    }
                 }
             },
             .invalid => {
@@ -1561,7 +1677,10 @@ pub const WebChannel = struct {
                 self.sendRelayError(session_id, request_id, "invalid_payload", "content is required");
                 return;
             };
-            const plain_sender = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
+            const claimed_sender = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
+            // Identity-bound: sender_id is always the connection's own identity,
+            // regardless of what the envelope claims.
+            const plain_sender = if (self.identity_tokens.len > 0) session_id else claimed_sender;
             self.publishInboundMessage(plain_sender, session_id, plain_content, request_id);
             return;
         }
@@ -1712,7 +1831,16 @@ pub const WebChannel = struct {
 
             const auth_header = h.headers.get("authorization");
             const token = extractQueryParam(url, "token") orelse extractBearerToken(auth_header orelse "");
-            if (token) |candidate| {
+
+            var identity: ?[]const u8 = null;
+            if (web_channel.identity_tokens.len > 0) {
+                // Identity-bound mode: a token is mandatory on every connection,
+                // including loopback - there is no pairing-mode fallback here.
+                identity = web_channel.resolveIdentityBoundHandshake(token) orelse {
+                    log.warn("WS connection rejected: missing or unrecognized identity-bound token", .{});
+                    return error.Forbidden;
+                };
+            } else if (token) |candidate| {
                 if (!web_channel.validateToken(candidate)) {
                     log.warn("WS connection rejected: invalid token", .{});
                     return error.Forbidden;
@@ -1730,9 +1858,9 @@ pub const WebChannel = struct {
                 log.info("WS client connected without upgrade token; waiting for pairing_request", .{});
             }
 
-            // Extract session_id from query (optional, default to "default")
-            const sid_raw = extractQueryParam(url, "session_id") orelse "default";
-            const sid = if (sid_raw.len == 0) "default" else sid_raw;
+            // Identity-bound: session_id is the resolved identity, never the
+            // client-supplied query param. Otherwise: query param, or "default".
+            const sid = resolveHandshakeSessionId(identity, extractQueryParam(url, "session_id"));
 
             var handler = WsHandler{
                 .web_channel = web_channel,
@@ -2004,6 +2132,12 @@ test "WebChannel initFromConfig clamps max_connections to tracked limit" {
     try std.testing.expectEqual(@as(u16, 64), ch.max_connections);
 }
 
+test "WebChannel initFromConfig defaults to non-identity-bound mode" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    try std.testing.expectEqual(@as(usize, 0), ch.configured_tokens.len);
+    try std.testing.expectEqual(@as(usize, 0), ch.identity_tokens.len);
+}
+
 test "WebChannel initFromConfig normalizes zero handshake size to default" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .max_handshake_size = 0,
@@ -2052,6 +2186,77 @@ test "WebChannel validateToken rejects wrong length" {
 test "WebChannel validateToken rejects before init" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{});
     try std.testing.expect(!ch.validateToken("a" ** 64));
+}
+
+test "resolveTokenIdentity resolves a known token to its canonical" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret", .canonical = "beezzoo" },
+        .{ .token = "admin-secret", .canonical = "admin" },
+    };
+    try std.testing.expectEqualStrings("beezzoo", ch.resolveTokenIdentity("beezzoo-secret").?);
+    try std.testing.expectEqualStrings("admin", ch.resolveTokenIdentity("admin-secret").?);
+}
+
+test "resolveTokenIdentity returns null for an unknown token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret", .canonical = "beezzoo" },
+    };
+    try std.testing.expect(ch.resolveTokenIdentity("unknown-token") == null);
+    try std.testing.expect(ch.resolveTokenIdentity("") == null);
+}
+
+test "resolveTokenIdentity scans every entry regardless of match position" {
+    // A match earlier or later in the list must resolve identically - this
+    // would fail if the implementation ever grew an early-exit `break`.
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    ch.identity_tokens = &.{
+        .{ .token = "token-a", .canonical = "alice" },
+        .{ .token = "token-b", .canonical = "bob" },
+        .{ .token = "token-c", .canonical = "carol" },
+    };
+    try std.testing.expectEqualStrings("alice", ch.resolveTokenIdentity("token-a").?);
+    try std.testing.expectEqualStrings("carol", ch.resolveTokenIdentity("token-c").?);
+}
+
+test "resolveIdentityBoundHandshake resolves a known token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret", .canonical = "beezzoo" },
+    };
+    try std.testing.expectEqualStrings("beezzoo", ch.resolveIdentityBoundHandshake("beezzoo-secret").?);
+}
+
+test "resolveIdentityBoundHandshake rejects an unknown token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret", .canonical = "beezzoo" },
+    };
+    try std.testing.expect(ch.resolveIdentityBoundHandshake("wrong-token") == null);
+}
+
+test "resolveIdentityBoundHandshake rejects a missing token, including on loopback" {
+    // Identity-bound mode never falls back to the pairing-mode unauthenticated
+    // loopback allowance - a token is always mandatory.
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{ .listen = "127.0.0.1" });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret", .canonical = "beezzoo" },
+    };
+    try std.testing.expect(ch.resolveIdentityBoundHandshake(null) == null);
+}
+
+test "resolveHandshakeSessionId uses the resolved identity, ignoring a differing query session_id" {
+    try std.testing.expectEqualStrings("beezzoo", WebChannel.resolveHandshakeSessionId("beezzoo", "admin"));
+}
+
+test "resolveHandshakeSessionId falls back to query session_id when not identity-bound" {
+    try std.testing.expectEqualStrings("custom-session", WebChannel.resolveHandshakeSessionId(null, "custom-session"));
+}
+
+test "resolveHandshakeSessionId defaults to default when neither identity nor query session_id is present" {
+    try std.testing.expectEqualStrings("default", WebChannel.resolveHandshakeSessionId(null, null));
+    try std.testing.expectEqualStrings("default", WebChannel.resolveHandshakeSessionId(null, ""));
 }
 
 test "WebChannel setBus stores bus reference" {
@@ -2299,6 +2504,121 @@ test "WebChannel local token mode ignores pairing_request events" {
     var bus = bus_mod.Bus.init();
     ch.setBus(&bus);
     ch.handleInboundEvent("{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-token\",\"payload\":{\"pairing_code\":\"123456\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+    try std.testing.expect(!ch.relay_pairing_guard.?.isPaired());
+}
+
+test "WebChannel identity-bound mode overrides sender_id with the connection identity" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .account_id = "web-main",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+    };
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    // forced_session_id ("beezzoo") is what WsHandler.init would have set from
+    // the resolved token identity - the envelope's claimed sender_id ("admin")
+    // must be ignored in favor of it.
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"beezzoo\",\"payload\":{\"content\":\"hello\",\"sender_id\":\"admin\"}}", "beezzoo");
+
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("beezzoo", msg.sender_id);
+    try std.testing.expectEqualStrings("beezzoo", msg.chat_id);
+}
+
+test "WebChannel identity-bound mode processes a message with no per-message auth_token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+    };
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"beezzoo\",\"payload\":{\"content\":\"hello\"}}", "beezzoo");
+
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello", msg.content);
+}
+
+test "WebChannel identity-bound mode accepts a per-message auth_token matching its own identity" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+    };
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"beezzoo\",\"payload\":{\"auth_token\":\"beezzoo-secret-token-0123456789\",\"content\":\"hello\"}}", "beezzoo");
+
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+}
+
+test "WebChannel identity-bound mode rejects a per-message auth_token for a different identity" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+        .{ .token = "admin-secret-token-0123456789xx", .canonical = "admin" },
+    };
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    // Connection is bound to "beezzoo" (forced_session_id), but the message
+    // presents admin's valid-but-wrong-owner token.
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"beezzoo\",\"payload\":{\"auth_token\":\"admin-secret-token-0123456789xx\",\"content\":\"hello\"}}", "beezzoo");
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel identity-bound mode rejects a per-message auth_token matching nothing" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+    };
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"beezzoo\",\"payload\":{\"auth_token\":\"totally-unknown-token-xxxxxxxx\",\"content\":\"hello\"}}", "beezzoo");
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel identity-bound mode still rejects pairing_request" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    ch.identity_tokens = &.{
+        .{ .token = "beezzoo-secret-token-0123456789", .canonical = "beezzoo" },
+    };
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"beezzoo\",\"payload\":{\"pairing_code\":\"123456\"}}", "beezzoo");
 
     try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
     try std.testing.expect(!ch.relay_pairing_guard.?.isPaired());

@@ -913,6 +913,20 @@ pub const MaixCamConfig = struct {
     name: []const u8 = "maixcam",
 };
 
+/// Binds a bearer token to a fixed identity for `channels.web`'s identity-bound
+/// mode (see `WebConfig.tokens`). Presenting the token at WS-upgrade sets the
+/// connection's session_id to `canonical`, instead of trusting a client-supplied
+/// session_id.
+pub const WebTokenIdentity = struct {
+    /// Literal bearer token. Mutually exclusive with `token_env`.
+    token: ?[]const u8 = null,
+    /// Name of the environment variable holding the bearer token, resolved at
+    /// startup. Mutually exclusive with `token`.
+    token_env: ?[]const u8 = null,
+    /// Identity granted to whoever presents the matching token.
+    canonical: []const u8,
+};
+
 pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
@@ -920,6 +934,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
+    pub const MAX_TOKEN_IDENTITY_CANONICAL_LEN: usize = 64;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
     pub const MIN_RELAY_PAIRING_CODE_TTL_SECS: u32 = 60;
     pub const MAX_RELAY_PAIRING_CODE_TTL_SECS: u32 = 300;
@@ -967,6 +982,11 @@ pub const WebConfig = struct {
     relay_ui_token_ttl_secs: u32 = 86_400,
     /// Require E2E payload encryption for relay user_message events.
     relay_e2e_required: bool = false,
+    /// Identity-bound tokens. Non-empty activates identity-bound mode: the
+    /// WS-upgrade token itself determines session_id (via the matched entry's
+    /// `canonical`), not a client-supplied session_id. Requires
+    /// `message_auth_mode = "token"` and is mutually exclusive with `auth_token`.
+    tokens: []const WebTokenIdentity = &.{},
 
     fn trimTrailingSlash(value: []const u8) []const u8 {
         if (value.len <= 1) return value;
@@ -1016,6 +1036,18 @@ pub const WebConfig = struct {
         if (trimmed.len < MIN_AUTH_TOKEN_LEN or trimmed.len > MAX_AUTH_TOKEN_LEN) return false;
         for (trimmed) |byte| {
             if (!isAllowedTokenByte(byte)) return false;
+        }
+        return true;
+    }
+
+    /// Identity-bound `canonical`: non-empty, at most 64 bytes (the size of
+    /// `WsHandler.session_id`), and restricted to `[A-Za-z0-9._-]` so it is
+    /// always safe to use verbatim as a session_id.
+    pub fn isValidTokenIdentityCanonical(raw: []const u8) bool {
+        if (raw.len == 0 or raw.len > MAX_TOKEN_IDENTITY_CANONICAL_LEN) return false;
+        for (raw) |byte| {
+            const ok = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-';
+            if (!ok) return false;
         }
         return true;
     }
@@ -2165,6 +2197,16 @@ test "WebConfig message auth mode validation supports pairing and token" {
     try std.testing.expect(WebConfig.isTokenMessageAuthMode("token"));
     try std.testing.expect(!WebConfig.isTokenMessageAuthMode("pairing"));
     try std.testing.expect(!WebConfig.isValidMessageAuthMode("jwt"));
+}
+
+test "WebConfig token identity canonical validation" {
+    try std.testing.expect(WebConfig.isValidTokenIdentityCanonical("beezzoo"));
+    try std.testing.expect(WebConfig.isValidTokenIdentityCanonical("user.one_two-3"));
+    try std.testing.expect(!WebConfig.isValidTokenIdentityCanonical(""));
+    try std.testing.expect(!WebConfig.isValidTokenIdentityCanonical("a" ** 65));
+    try std.testing.expect(WebConfig.isValidTokenIdentityCanonical("a" ** 64));
+    try std.testing.expect(!WebConfig.isValidTokenIdentityCanonical("bad user"));
+    try std.testing.expect(!WebConfig.isValidTokenIdentityCanonical("bad/slash"));
 }
 
 test "WebConfig relay URL validation requires wss authority" {
