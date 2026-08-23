@@ -649,9 +649,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Enable streaming if provider supports it.
         // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
         // <think> content is printed live instead of being silently stripped.
+        //
+        // suppress_live is unconditionally true here: `-m` mode's stdout is
+        // captured verbatim by agent_runner.zig (heartbeat/cron) and delivered
+        // as the message. cliStreamSinkCallback has no concept of "final turn"
+        // vs "intermediate tool-calling iteration" (TagFilter only strips
+        // <tool_call> markup within a chunk, not whole-iteration narration),
+        // so every iteration's live-streamed text would otherwise leak into
+        // the delivered report. Streaming itself stays on underneath (keeping
+        // is_streaming's native_tools/retry semantics unchanged) — only the
+        // live stdout print is suppressed. See d07b7eee/d09a1e5f for the
+        // earlier, narrower fixes to the (irrelevant-when-streaming)
+        // non-streaming intermediary-print path.
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
-            .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
+            .suppress_live = true,
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
