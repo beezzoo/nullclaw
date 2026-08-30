@@ -156,6 +156,30 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
     };
 }
 
+// Last-mile safety net for the 2026-08-16/08-21/08-23/08-30 message-leak
+// incidents: `agent/dispatcher.zig`'s `containsToolCallMarkup`, its XML
+// marker parser, and `streaming.zig`'s `TagFilter` each independently guard
+// against tool-call markup using a closed whitelist of *exact* tag
+// spellings (`<tool_call>`, `[TOOL_CALL]`, ...) — and each has, in
+// production, missed a malformed variant the model actually produced
+// (`<tool_call]>`, `<tool_call_error>`, an unclosed `<tool_call`, a
+// hallucinated `Human:` turn boundary, ...). Patching one exact spelling at
+// a time is a losing game against unbounded model hallucination shapes.
+//
+// This check instead guards the single choke point where subprocess stdout
+// becomes an unattended, automatically-delivered message (heartbeat/cron):
+// a broad, shape-based heuristic ("does this look like it contains raw
+// tool-call/turn-boundary plumbing at all"), not an exact-string match.
+// False positives here just mean a generic fallback replaces one delivered
+// report — much cheaper than another garbled message reaching the user.
+fn looksLikeLeakedInternalMarkup(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "<tool") != null) return true;
+    if (std.mem.indexOf(u8, text, "[TOOL_CALL") != null) return true;
+    if (std.mem.indexOf(u8, text, "[tool_call") != null) return true;
+    if (std.mem.indexOf(u8, text, "Human:") != null) return true;
+    return false;
+}
+
 fn buildAgentOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
@@ -180,6 +204,9 @@ fn buildAgentOutput(
     // `nullclaw agent -m` writes responses to stdout. Stderr is drained by the
     // runner to avoid pipe backpressure, but it only contains logs/diagnostics
     // and must never become user-visible agent output.
+    if (looksLikeLeakedInternalMarkup(stdout)) {
+        return allocator.dupe(u8, "[agent produced malformed output — internal/tool-call markup detected in the response, message suppressed. Check logs for details.]");
+    }
     return allocator.dupe(u8, stdout);
 }
 
@@ -483,6 +510,54 @@ test "buildAgentOutput returns stdout on success" {
     const result = try buildAgentOutput(allocator, "hello", 0, false, true);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("hello", result);
+}
+
+test "buildAgentOutput suppresses hallucinated tool_call_error markup" {
+    // Regression for the 2026-08-30 web_search-failure incident: the model
+    // hallucinated its own pseudo-XML echoing the internal <tool_result
+    // status="error"> format it had seen, and it leaked verbatim as the
+    // "successful" delivered message.
+    const allocator = std.testing.allocator;
+    const leaked =
+        \\<tool_call_error>
+        \\<tool_name>web_search</tool_name>
+        \\<error>Web search failed: request failed after 3 attempts</error>
+        \\<tool_name>web_search</tool_name>
+        \\</tool_call_error>
+        \\<tool_name>web_fetch</tool_name>
+        \\</tool_call_error>
+    ;
+    const result = try buildAgentOutput(allocator, leaked, 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "markup detected") != null);
+}
+
+test "buildAgentOutput suppresses malformed tool_call tag variants" {
+    // Regression for a live incident where the model emitted non-canonical
+    // tag shapes (<tool_call]>, <tool_call[]>) that the exact-string
+    // whitelists in dispatcher.containsToolCallMarkup don't recognize.
+    const allocator = std.testing.allocator;
+    const leaked = "<tool_call]> {\"name\": \"web_search\"} </tool_call";
+    const result = try buildAgentOutput(allocator, leaked, 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_call") == null);
+}
+
+test "buildAgentOutput suppresses a hallucinated Human: turn boundary" {
+    const allocator = std.testing.allocator;
+    const leaked = "Готово.\nHuman: продолжай\nAssistant: конечно";
+    const result = try buildAgentOutput(allocator, leaked, 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Human:") == null);
+}
+
+test "buildAgentOutput leaves an ordinary clean report untouched" {
+    const allocator = std.testing.allocator;
+    const clean = "Погода в Москве сегодня:\n🌤️ Переменная облачность\n🌡️ +20…+23 °C";
+    const result = try buildAgentOutput(allocator, clean, 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(clean, result);
 }
 
 test "buildAgentOutput returns generic message for empty failure" {
