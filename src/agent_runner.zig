@@ -8,6 +8,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const dispatcher = @import("agent/dispatcher.zig");
 
 pub const AgentRunResult = struct {
     success: bool,
@@ -166,19 +167,19 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
 // hallucinated `Human:` turn boundary, ...). Patching one exact spelling at
 // a time is a losing game against unbounded model hallucination shapes.
 //
-// This check instead guards the single choke point where subprocess stdout
-// becomes an unattended, automatically-delivered message (heartbeat/cron):
-// a broad, shape-based heuristic ("does this look like it contains raw
-// tool-call/turn-boundary plumbing at all"), not an exact-string match.
-// False positives here just mean a generic fallback replaces one delivered
-// report — much cheaper than another garbled message reaching the user.
-fn looksLikeLeakedInternalMarkup(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, "<tool") != null) return true;
-    if (std.mem.indexOf(u8, text, "[TOOL_CALL") != null) return true;
-    if (std.mem.indexOf(u8, text, "[tool_call") != null) return true;
-    if (std.mem.indexOf(u8, text, "Human:") != null) return true;
-    return false;
-}
+// This check guards the single choke point where subprocess stdout becomes
+// an unattended, automatically-delivered message (heartbeat/cron): a broad,
+// shape-based heuristic ("does this look like it contains raw tool-call/
+// turn-boundary plumbing at all"), not an exact-string match. False
+// positives here just mean a generic fallback replaces one delivered report
+// — much cheaper than another garbled message reaching the user.
+//
+// 2026-08-31: this used to be a private copy of the same logic living only
+// here, gating delivery but not `agent/root.zig`'s `selectDisplayText` —
+// which meant malformed output could still slip into session history and
+// get auto-saved to memory before ever reaching this check, re-poisoning
+// future context on every failed tick. Now shared via
+// `dispatcher.containsLeakedMarkupBroad`, used at both gates.
 
 fn buildAgentOutput(
     allocator: std.mem.Allocator,
@@ -204,7 +205,7 @@ fn buildAgentOutput(
     // `nullclaw agent -m` writes responses to stdout. Stderr is drained by the
     // runner to avoid pipe backpressure, but it only contains logs/diagnostics
     // and must never become user-visible agent output.
-    if (looksLikeLeakedInternalMarkup(stdout)) {
+    if (dispatcher.containsLeakedMarkupBroad(stdout)) {
         return allocator.dupe(u8, "[agent produced malformed output — internal/tool-call markup detected in the response, message suppressed. Check logs for details.]");
     }
     return allocator.dupe(u8, stdout);

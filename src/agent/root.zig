@@ -946,17 +946,20 @@ pub const Agent = struct {
             // inner JSON failed to parse) that survived alongside it. Never show
             // that raw markup to the user — same rule as the branches below.
             if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            if (dispatcher.containsLeakedMarkupBroad(parsed_text)) return "";
             return parsed_text;
         }
         if (parsed_text.len > 0) {
             // Some malformed/unclosed tool-call payloads can survive into parsed_text
             // via parser recovery fallbacks. Suppress them from user-visible output.
             if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            if (dispatcher.containsLeakedMarkupBroad(parsed_text)) return "";
             return parsed_text;
         }
         // If tool-call markup exists but parsing produced no valid calls/text,
         // never show the raw payload to the user.
         if (dispatcher.containsToolCallMarkup(response_text)) return "";
+        if (dispatcher.containsLeakedMarkupBroad(response_text)) return "";
         return response_text;
     }
 

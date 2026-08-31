@@ -113,6 +113,22 @@ pub fn containsToolCallMarkup(text: []const u8) bool {
         std.mem.indexOf(u8, text, "[/tool_call]") != null;
 }
 
+/// Broader, shape-based leak detector for malformed/mutant tool-call markup
+/// and other internal-only tokens that don't match `containsToolCallMarkup`'s
+/// exact-string whitelist (e.g. `<tool_call">`, unclosed `<tool_call`,
+/// hallucinated `Human:` turns). Deliberately over-inclusive: used to gate
+/// what becomes display text/session history/memory storage and what gets
+/// delivered as final output, where a false positive just means an
+/// occasional real report gets suppressed, but a false negative lets raw
+/// internal markup leak to the user or poison memory.
+pub fn containsLeakedMarkupBroad(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "<tool") != null) return true;
+    if (std.mem.indexOf(u8, text, "[TOOL_CALL") != null) return true;
+    if (std.mem.indexOf(u8, text, "[tool_call") != null) return true;
+    if (std.mem.indexOf(u8, text, "Human:") != null) return true;
+    return false;
+}
+
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
 ///
 /// Expected format:
@@ -2468,6 +2484,17 @@ test "containsToolCallMarkup detects orphan closing tag" {
     try std.testing.expect(containsToolCallMarkup("</tool_call>"));
     try std.testing.expect(containsToolCallMarkup("Here are the results:\n[/TOOL_CALL]\nSome reply"));
     try std.testing.expect(containsToolCallMarkup("[/tool_call]"));
+}
+
+test "containsLeakedMarkupBroad catches mutant tag missed by containsToolCallMarkup" {
+    // Live incident 2026-08-31 13:08:29: model emitted `<tool_call">` (stray
+    // quote before the closing bracket) — containsToolCallMarkup's exact
+    // "<tool_call>" match misses it, but the broad check must not.
+    const mutant = "<tool_call\">\n{\"name\": \"shell\", \"arguments\": {\"command\": \"cat .nullclaw/heartbeat-state.json\"}}";
+    try std.testing.expect(!containsToolCallMarkup(mutant));
+    try std.testing.expect(containsLeakedMarkupBroad(mutant));
+    try std.testing.expect(containsLeakedMarkupBroad("Human: what should I do next?"));
+    try std.testing.expect(!containsLeakedMarkupBroad("plain reply text"));
 }
 
 test "isNativeJsonFormat false for XML response" {
