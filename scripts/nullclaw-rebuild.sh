@@ -4,13 +4,21 @@
 #
 # Lives in the fork (branch locus); each host symlinks it into ~/.local/bin:
 #   ln -sf ~/Downloads/nullclaw/scripts/nullclaw-rebuild.sh ~/.local/bin/
-# Overrides: NULLCLAW_REPO (default: checkout containing this script),
-#            NULLCLAW_BIN  (default: $HOME/.local/bin/nullclaw),
-#            ZIG           (default: zig from PATH).
+# Overrides: NULLCLAW_REPO    (default: checkout containing this script),
+#            NULLCLAW_BIN     (default: $HOME/.local/bin/nullclaw),
+#            NULLCLAW_SERVICE (default: nullclaw.service, a systemd --user unit),
+#            ZIG              (default: zig from PATH).
+# Per-host values can live in ~/.config/nullclaw-rebuild.env (sourced if present), e.g.
+#   ZIG=$HOME/.local/zig-x86_64-linux-0.16.0/zig
+#   NULLCLAW_SERVICE=nullclaw-miram.service
 set -e
+
+HOST_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/nullclaw-rebuild.env"
+[ -f "$HOST_ENV" ] && . "$HOST_ENV"
 
 REPO="${NULLCLAW_REPO:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
 BIN="${NULLCLAW_BIN:-$HOME/.local/bin/nullclaw}"
+SERVICE="${NULLCLAW_SERVICE:-nullclaw.service}"
 ZIG="${ZIG:-zig}"
 
 if ! command -v "$ZIG" >/dev/null 2>&1; then
@@ -43,8 +51,8 @@ cp -f "$BIN" "${BIN}.bak"
 echo "==> installing new binary to $BIN"
 cp -f "$REPO/zig-out/bin/nullclaw" "$BIN"
 
-echo "==> restarting nullclaw.service"
-systemctl --user restart nullclaw.service
+echo "==> restarting $SERVICE"
+systemctl --user restart "$SERVICE"
 
 sleep 1
-systemctl --user status nullclaw.service --no-pager -l | head -10
+systemctl --user status "$SERVICE" --no-pager -l | head -10
