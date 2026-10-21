@@ -2965,6 +2965,7 @@ fn userFacingAgentError(err: anyerror) []const u8 {
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
         error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.ContentFiltered => "The provider's content moderation rejected this request. Try again.",
         error.OutOfMemory => "Out of memory.",
         else => "An error occurred. Try again.",
     };
@@ -2976,6 +2977,7 @@ fn userFacingAgentErrorJson(err: anyerror) []const u8 {
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
         error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",
         error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
+        error.ContentFiltered => "{\"error\":\"provider content moderation rejected the request\"}",
         error.OutOfMemory => "{\"error\":\"out of memory\"}",
         else => "{\"error\":\"agent failure\"}",
     };
@@ -10116,6 +10118,17 @@ test "userFacingAgentError maps NoResponseContent" {
     try std.testing.expectEqualStrings(
         "Model returned an empty response. Please try again.",
         userFacingAgentError(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentError maps ContentFiltered" {
+    try std.testing.expectEqualStrings(
+        "The provider's content moderation rejected this request. Try again.",
+        userFacingAgentError(error.ContentFiltered),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"provider content moderation rejected the request\"}",
+        userFacingAgentErrorJson(error.ContentFiltered),
     );
 }
 

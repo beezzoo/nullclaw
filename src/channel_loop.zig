@@ -169,6 +169,7 @@ fn defaultAgentErrorMessage(err: anyerror) []const u8 {
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
         error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+        error.ContentFiltered => "The provider's content moderation rejected this request (a long conversation history is a common trigger). Try again, or /new for a fresh session.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
         error.OutOfMemory => "Out of memory.",
         else => "An error occurred. Try again or /new for a fresh session.",
@@ -179,6 +180,7 @@ fn compactAgentErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
         error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.ContentFiltered => "The provider's content moderation rejected this request. Try again.",
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
         else => "An error occurred. Try again.",
     };
@@ -3199,6 +3201,13 @@ test "detailedProviderErrorForDisplay ignores non-provider errors" {
 test "compactAgentErrorMessage keeps non-telegram fallback concise" {
     // Regression: Signal/Matrix/Max should not inherit Telegram's `/new` guidance for generic failures.
     try std.testing.expectEqualStrings("An error occurred. Try again.", compactAgentErrorMessage(error.Unexpected));
+}
+
+test "agent error messages name content moderation rejections" {
+    try std.testing.expect(std.mem.indexOf(u8, defaultAgentErrorMessage(error.ContentFiltered), "content moderation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, defaultAgentErrorMessage(error.ContentFiltered), "/new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compactAgentErrorMessage(error.ContentFiltered), "content moderation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compactAgentErrorMessage(error.ContentFiltered), "/new") == null);
 }
 
 test "telegram update offset store returns null for mismatched bot id" {

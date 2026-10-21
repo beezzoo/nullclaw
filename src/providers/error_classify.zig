@@ -5,6 +5,7 @@ pub const ApiErrorKind = enum {
     rate_limited,
     context_exhausted,
     vision_unsupported,
+    content_filtered,
     other,
 };
 
@@ -13,6 +14,7 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
         .rate_limited => error.RateLimited,
         .context_exhausted => error.ContextLengthExceeded,
         .vision_unsupported => error.ProviderDoesNotSupportVision,
+        .content_filtered => error.ContentFiltered,
         .other => error.ApiError,
     };
 }
@@ -192,6 +194,14 @@ fn classifyFromFields(
         if (status_code == 413) return .context_exhausted;
     }
 
+    // Before the context checks: moderation messages can contain words the
+    // context heuristics key on ("input", "token", "exceed").
+    for ([_]?[]const u8{ code, type_name, message }) |field| {
+        if (field) |text| {
+            if (text_helpers.isContentFilteredText(text)) return .content_filtered;
+        }
+    }
+
     if (message) |msg| {
         if (text_helpers.isRateLimitedText(msg)) return .rate_limited;
         if (text_helpers.isContextExhaustedText(msg)) return .context_exhausted;
@@ -317,6 +327,24 @@ test "classifyKnownApiError detects vision unsupported payloads" {
 
     try std.testing.expectEqual(.vision_unsupported, classifyKnownApiError(parsed.value.object).?);
     try std.testing.expect(kindToError(.vision_unsupported) == error.ProviderDoesNotSupportVision);
+}
+
+test "classifyKnownApiError detects content moderation payloads" {
+    // Verbatim tokenplan (Alibaba MaaS) rejection body.
+    const body = "{\"error\":{\"code\":\"data_inspection_failed\",\"param\":null,\"message\":\"Input text data may contain inappropriate content.\",\"type\":\"data_inspection_failed\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(.content_filtered, classifyKnownApiError(parsed.value.object).?);
+    try std.testing.expect(kindToError(.content_filtered) == error.ContentFiltered);
+}
+
+test "classifyKnownApiError keeps unrelated errors as other" {
+    const body = "{\"error\":{\"code\":\"model_not_found\",\"message\":\"Invalid model: foo\",\"type\":\"invalid_request_error\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(.other, classifyKnownApiError(parsed.value.object).?);
 }
 
 test "classifyKnownApiError returns null for non-error payload" {

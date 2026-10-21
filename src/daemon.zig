@@ -1374,6 +1374,7 @@ fn processInboundMessage(
             error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
             error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
             error.NoResponseContent => "Model returned an empty response. Please try again.",
+            error.ContentFiltered => "The provider's content moderation rejected this request. Try again.",
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again.",
         };

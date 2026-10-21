@@ -2438,7 +2438,10 @@ pub const Agent = struct {
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
-                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
+                        if (providers.reliable.isContextExhausted(@errorName(retry_err)) and
+                            self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                            self.forceCompressHistory())
+                        {
                             self.context_was_compacted = true;
                             const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
                             const recovery_max_tokens = self.effectiveMaxTokensForTurn(
@@ -5910,6 +5913,104 @@ test "turn records llm request for immediate context-compaction retry" {
     try std.testing.expectEqual(@as(usize, 2), observer.llm_request_message_counts_len);
     try std.testing.expect(observer.llm_request_message_counts[1] < observer.llm_request_message_counts[0]);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+}
+
+const ScriptedErrorProvider = struct {
+    errors: []const anyerror,
+    calls: u32 = 0,
+    noop: observability.NoopObserver = .{},
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *ScriptedErrorProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.calls <= self.errors.len) return self.errors[self.calls - 1];
+        return .{
+            .content = try allocator.dupe(u8, "recovered"),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, "test-model"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "scripted-error-provider";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn agentWithHistory(self: *ScriptedErrorProvider, allocator: std.mem.Allocator) !Agent {
+        var agent = Agent{
+            .allocator = allocator,
+            .provider = .{ .ptr = @ptrCast(self), .vtable = &vtable },
+            .tools = &.{},
+            .tool_specs = try allocator.alloc(ToolSpec, 0),
+            .mem = null,
+            .observer = self.noop.observer(),
+            .model_name = "test-model",
+            .temperature = 0.7,
+            .workspace_dir = "/tmp",
+            .max_tool_iterations = 2,
+            .max_history_messages = 50,
+            .auto_save = false,
+            .history = .empty,
+            .total_tokens = 0,
+            .has_system_prompt = true,
+        };
+        errdefer agent.deinit();
+        try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+        for (0..7) |idx| {
+            try agent.history.append(allocator, .{
+                .role = if (idx % 2 == 0) .user else .assistant,
+                .content = try std.fmt.allocPrint(allocator, "m{d}", .{idx}),
+            });
+        }
+        return agent;
+    }
+};
+
+test "turn keeps history when retry fails with a non-context error" {
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    var provider_state = ScriptedErrorProvider{ .errors = &.{ error.ContentFiltered, error.ContentFiltered } };
+    var agent = try provider_state.agentWithHistory(std.testing.allocator);
+    defer agent.deinit();
+
+    try std.testing.expectError(error.ContentFiltered, agent.turn("hello"));
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
+    try std.testing.expect(!agent.context_was_compacted);
+    try std.testing.expect(agent.history.items.len >= 8);
+    try std.testing.expectEqualStrings("m0", agent.history.items[1].content);
+}
+
+test "turn still compresses when retry fails with context exhaustion" {
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    var provider_state = ScriptedErrorProvider{ .errors = &.{ error.ApiError, error.ContextLengthExceeded } };
+    var agent = try provider_state.agentWithHistory(std.testing.allocator);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expectEqual(@as(u32, 3), provider_state.calls);
+    try std.testing.expect(std.mem.startsWith(u8, response, "[Context compacted]"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "recovered") != null);
 }
 
 test "slash /help returns help text" {

@@ -343,7 +343,8 @@ pub const ReliableProvider = struct {
         if (err == error.ApiError or
             err == error.RateLimited or
             err == error.ContextLengthExceeded or
-            err == error.ProviderDoesNotSupportVision)
+            err == error.ProviderDoesNotSupportVision or
+            err == error.ContentFiltered)
         {
             return;
         }
@@ -357,6 +358,7 @@ pub const ReliableProvider = struct {
         if (isRateLimited(err_slice)) return error.RateLimited;
         if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
+        if (std.mem.eql(u8, err_slice, "ContentFiltered")) return error.ContentFiltered;
         return error.AllProvidersFailed;
     }
 
@@ -403,7 +405,7 @@ pub const ReliableProvider = struct {
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
 
-                if (isNonRetryable(err_slice)) break;
+                if (err == error.ContentFiltered or isNonRetryable(err_slice)) break;
 
                 if (isRateLimited(err_slice)) {
                     if (self.extras.len > 0) break;
@@ -448,7 +450,7 @@ pub const ReliableProvider = struct {
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
 
-                if (isNonRetryable(err_slice)) break;
+                if (err == error.ContentFiltered or isNonRetryable(err_slice)) break;
 
                 if (isRateLimited(err_slice)) {
                     if (self.extras.len > 0) break;
@@ -1155,6 +1157,25 @@ test "ReliableProvider propagates context errors for recovery" {
 
     const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
     try std.testing.expectError(error.ContextLengthExceeded, result);
+}
+
+test "ReliableProvider propagates content-filtered errors without retrying" {
+    var mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.ContentFiltered,
+        .supports_tools = true,
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 1);
+    const prov = reliable.provider();
+
+    try std.testing.expectError(error.ContentFiltered, prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5));
+    try std.testing.expect(mock.call_count == 1);
+
+    mock.call_count = 0;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    try std.testing.expectError(error.ContentFiltered, prov.chat(std.testing.allocator, .{ .messages = &msgs }, "model", 0.5));
+    try std.testing.expect(mock.call_count == 1);
 }
 
 test "ReliableProvider vtable chat retries then recovers" {

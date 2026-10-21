@@ -101,3 +101,26 @@ test "isVisionUnsupportedText does not false-positive on unrelated image mention
     const text = "Please provide an image description";
     try std.testing.expect(!isVisionUnsupportedText(text));
 }
+
+/// Provider-side content moderation rejected the request (input or output).
+pub fn isContentFilteredText(text: []const u8) bool {
+    if (text.len == 0) return false;
+    return containsAsciiFold(text, "data_inspection_failed") or
+        containsAsciiFold(text, "inappropriate content") or
+        containsAsciiFold(text, "content_filter") or
+        containsAsciiFold(text, "content filter") or
+        containsAsciiFold(text, "content management policy");
+}
+
+test "isContentFilteredText matches provider moderation phrasings" {
+    try std.testing.expect(isContentFilteredText("data_inspection_failed"));
+    try std.testing.expect(isContentFilteredText("Input text data may contain inappropriate content."));
+    try std.testing.expect(isContentFilteredText("content_filter"));
+    try std.testing.expect(isContentFilteredText("The response was filtered due to the prompt triggering Azure OpenAI's content management policy."));
+}
+
+test "isContentFilteredText does not false-positive on unrelated errors" {
+    try std.testing.expect(!isContentFilteredText("This model's maximum context length is 128000 tokens"));
+    try std.testing.expect(!isContentFilteredText("Invalid model: foo"));
+    try std.testing.expect(!isContentFilteredText(""));
+}
